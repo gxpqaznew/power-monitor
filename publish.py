@@ -101,22 +101,91 @@ def build_installer() -> Path:
     return installer
 
 
-def git_commit(ver: str) -> bool:
+def _api_push(before: str, after: str, repo: str) -> bool:
+    """git push 失败时的兜底：走 api.github.com 的 Git Data API 重放提交。
+
+    本机沙箱/代理只放通 api.github.com，github.com 的 CONNECT 会被 502，
+    因此 git-over-HTTPS 推不上去；改用 API 建 blob→tree→commit→更新 ref。
+    """
+    import base64
+    import json
+
+    def api(path, method="POST", body=None):
+        cmd = ["gh", "api", path, "-X", method]
+        if body is not None:
+            cmd += ["--input", "-"]
+        p = subprocess.run(cmd, cwd=str(PROJECT), input=json.dumps(body) if body is not None else None,
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise SystemExit(f"gh api {path} 失败:\n{p.stderr}")
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+
+    revs = subprocess.run(["git", "rev-list", "--reverse", f"{before}..{after}"],
+                          cwd=str(PROJECT), capture_output=True, text=True).stdout.split()
+    if not revs:
+        print("（没有新提交需要推送）")
+        return True
+    print(f"  兜底 API 推送 {len(revs)} 个提交…")
+    parent = before
+    for rev in revs:
+        msg = subprocess.run(["git", "log", "-1", "--format=%B", rev], cwd=str(PROJECT),
+                             capture_output=True, text=True).stdout.strip()
+        changes = subprocess.run(["git", "diff-tree", "--no-commit-id", "--name-status", "-r", rev],
+                                 cwd=str(PROJECT), capture_output=True, text=True).stdout.splitlines()
+        entries = []
+        for line in changes:
+            parts = line.split("\t")
+            status, path = parts[0], parts[-1]
+            if status.startswith("D"):
+                entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+                continue
+            content = subprocess.run(["git", "show", f"{rev}:{path}"], cwd=str(PROJECT),
+                                     capture_output=True).stdout
+            blob = api(f"/repos/{repo}/git/blobs", "POST",
+                       {"content": base64.b64encode(content).decode(), "encoding": "base64"})
+            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+        ptree = api(f"/repos/{repo}/git/commits/{parent}", "GET")["tree"]["sha"]
+        tree = api(f"/repos/{repo}/git/trees", "POST", {"base_tree": ptree, "tree": entries})
+        commit = api(f"/repos/{repo}/git/commits", "POST",
+                     {"message": msg, "tree": tree["sha"], "parents": [parent]})
+        parent = commit["sha"]
+    api(f"/repos/{repo}/git/refs/heads/main", "PATCH", {"sha": parent, "force": False})
+    print(f"  已用 API 推送到 main（{parent[:7]}）")
+    return True
+
+
+def git_commit(ver: str, repo: str = DEFAULT_REPO) -> bool:
     try:
         _run(["git", "rev-parse", "--is-inside-work-tree"],
              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("（不在 git 仓库，跳过提交）")
         return False
-    _run(["git", "add", str(NSIS)])
-    _run(["git", "commit", "-m", f"release v{ver}"],
-         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 把源码改动和版本文件一起提交（源码改动由用户/上层先行 add，这里兜底全提）
+    _run(["git", "add", "-A"])
+    head_before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(PROJECT),
+                                 capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "commit", "-m", f"release v{ver}"], cwd=str(PROJECT),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(PROJECT),
+                                capture_output=True, text=True).stdout.strip()
     print("已提交版本变更")
-    try:
-        _run(["git", "push"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.run(["git", "push"], cwd=str(PROJECT), capture_output=True, text=True)
+    if p.returncode == 0:
         print("已推送到 origin")
-    except subprocess.CalledProcessError:
-        print("（推送失败：可能没有配置 origin，Release 标签会指向本地提交）")
+        return True
+    print(f"（git push 失败：{p.stderr.strip().splitlines()[-1] if p.stderr.strip() else '未知'}）")
+    print("  改用 api.github.com 兜底推送…")
+    # 远端 main 当前指向哪，就从哪开始重放
+    try:
+        base = subprocess.run(["gh", "api", f"repos/{repo}/commits/main", "-q", ".sha"],
+                              cwd=str(PROJECT), capture_output=True, text=True).stdout.strip()
+    except Exception:
+        base = ""
+    if not base:
+        print("  拿不到远端 main，跳过")
+        return False
+    _api_push(base, head_after, repo)
     return True
 
 
@@ -151,7 +220,7 @@ def main() -> int:
     installer = build_installer()
     print(f"安装包：{installer}  ({installer.stat().st_size/1048576:.2f} MB)")
 
-    git_commit(ver)
+    git_commit(ver, args.repo)
 
     notes = args.notes
     if not notes and (PROJECT / "NOTES.md").exists():

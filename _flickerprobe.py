@@ -23,6 +23,32 @@ except Exception:
 SRCCOPY = 0x00CC0020
 ENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
+# GDI 句柄是 64 位指针，不声明 argtypes 时 ctypes 按 32 位 int 传，
+# 句柄值大一点就 OverflowError（已踩过）。这里统一声明。
+_HDC = ctypes.c_void_p
+_HGDIOBJ = ctypes.c_void_p
+g.CreateCompatibleDC.argtypes = [_HDC]
+g.CreateCompatibleDC.restype = _HDC
+g.SelectObject.argtypes = [_HDC, _HGDIOBJ]
+g.SelectObject.restype = _HGDIOBJ
+g.BitBlt.argtypes = [_HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                     _HDC, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+g.BitBlt.restype = wintypes.BOOL
+g.DeleteObject.argtypes = [_HGDIOBJ]
+g.DeleteObject.restype = wintypes.BOOL
+g.DeleteDC.argtypes = [_HDC]
+g.DeleteDC.restype = wintypes.BOOL
+u.GetDC.argtypes = [wintypes.HWND]
+u.GetDC.restype = _HDC
+u.ReleaseDC.argtypes = [wintypes.HWND, _HDC]
+u.ReleaseDC.restype = ctypes.c_int
+u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+u.FindWindowW.restype = wintypes.HWND
+u.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+u.FindWindowExW.restype = wintypes.HWND
+u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+u.GetAncestor.restype = wintypes.HWND
+
 
 def cls(h):
     b = ctypes.create_unicode_buffer(64)
@@ -50,17 +76,18 @@ def capture(rect):
     old = g.SelectObject(mdc, bmp)
     g.BitBlt(mdc, 0, 0, w, h, sdc, x, y, SRCCOPY)
     g.SelectObject(mdc, old)
+    data = bytes(view)          # 必须在 DeleteObject 之前拷走，否则读已释放内存会段错误
     g.DeleteObject(bmp)
     g.DeleteDC(mdc)
     u.ReleaseDC(None, sdc)
-    return bytes(view)
+    return data
 
 
 def save_bmp(path, pixels, w, h):
     import struct
     row = w * 4
     header = struct.pack("<2sIHHI", b"BM", 14 + 40 + row * h, 0, 0, 14 + 40)
-    info = struct.pack("<IiiHHIIiiII", 40, h, -h, 1, 32, 0, row * h,
+    info = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, row * h,
                        2835, 2835, 0, 0)
     Path(path).write_bytes(header + info + pixels)
 
@@ -74,15 +101,20 @@ def main():
         except (psutil.NoSuchMethodError, psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    strip = u.FindWindowW("PowerMonitorTaskbarStrip", None)
+    # 长条现在是任务栏的子窗口（WS_CHILD + SetParent），FindWindowW 找不到顶级窗口，
+    # 必须用 FindWindowExW 到 Shell_TrayWnd 下找；找不到再退回顶级查询（老版本兼容）。
     tray = u.FindWindowW("Shell_TrayWnd", None)
+    strip = u.FindWindowExW(tray, None, "PowerMonitorTaskbarStrip", None) if tray else 0
+    if not strip:
+        strip = u.FindWindowW("PowerMonitorTaskbarStrip", None)
     if not strip:
         print("!! 找不到长条窗口（可能没装新版 / strip 功能关了）")
         return 1
+    is_child = bool(tray) and u.GetAncestor(strip, 2) == tray  # GA_ROOT
     r = wintypes.RECT()
     u.GetWindowRect(strip, ctypes.byref(r))
     rect = (r.left, r.top, r.right, r.bottom)
-    print(f"strip={strip:#x} tray={tray:#x} rect={rect}")
+    print(f"strip={strip:#x} tray={tray:#x} child={is_child} rect={rect}")
 
     t0 = time.time()
     prev = None
@@ -92,17 +124,22 @@ def main():
         vis = bool(u.IsWindowVisible(strip))
         cloaked = ctypes.c_uint(0)
         d.DwmGetWindowAttribute(strip, 14, ctypes.byref(cloaked), 4)  # DWMWA_CLOAKED
-        zo = zorder()
-        s_in = zo.index(strip) if strip in zo else -1
-        t_in = zo.index(tray) if tray in zo else -1
+        if is_child:
+            # 子窗口不进顶级 z 序表；用同父兄弟链表里前一个窗口句柄当稳定性指标
+            zrel = u.GetWindow(strip, 3)  # GW_HWNDPREV
+        else:
+            zo = zorder()
+            s_in = zo.index(strip) if strip in zo else -1
+            t_in = zo.index(tray) if tray in zo else -1
+            zrel = s_in - t_in
         rr = wintypes.RECT()
         u.GetWindowRect(strip, ctypes.byref(rr))
         fg = cls(u.GetForegroundWindow())
-        cur = (vis, cloaked.value, s_in - t_in,
+        cur = (vis, cloaked.value, zrel,
                (rr.left, rr.top, rr.right, rr.bottom), fg)
         if cur != prev:
             print(f"{time.time()-t0:6.2f}s vis={vis} cloaked={cloaked.value} "
-                  f"z_rel={s_in - t_in} rect={(rr.left, rr.top, rr.right, rr.bottom)} fg={fg}")
+                  f"z_rel={zrel} rect={(rr.left, rr.top, rr.right, rr.bottom)} fg={fg}")
             prev = cur
         if i in cap_at:
             shots[cap_at[i]] = capture(rect)

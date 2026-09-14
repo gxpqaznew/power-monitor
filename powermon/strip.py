@@ -130,6 +130,7 @@ class TaskbarStrip:
         self._hwnd = None
         self._parent = None     # 嵌进任务栏后的父窗口（Shell_TrayWnd）
         self._fonts: dict[str, int] = {}
+        self._digit_w: dict[int, dict[str, int]] = {}   # 每个字体下 0-9 的宽度（防抖动用）
         self._brushes: dict[int, int] = {}
         self._pens: dict[tuple[int, int], int] = {}
         self._mem_dc = None
@@ -220,6 +221,7 @@ class TaskbarStrip:
         for font in self._fonts.values():
             gdi32.DeleteObject(font)
         self._fonts.clear()
+        self._digit_w.clear()
         for brush in self._brushes.values():
             gdi32.DeleteObject(brush)
         self._brushes.clear()
@@ -289,12 +291,41 @@ class TaskbarStrip:
         rect = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
         user32.FillRect(dc, ctypes.byref(rect), self._brush(color))
 
-    def _text_width(self, dc, text: str, font) -> int:
+    def _raw_text_width(self, dc, text: str, font) -> int:
         old = gdi32.SelectObject(dc, font)
         size = SIZE()
         gdi32.GetTextExtentPoint32W(dc, text, len(text), ctypes.byref(size))
         gdi32.SelectObject(dc, old)
         return size.cx
+
+    def _digit_widths(self, dc, font) -> dict[str, int]:
+        """量一遍 0-9 各自宽度并缓存（同一字体只量一次）。"""
+        cached = self._digit_w.get(font)
+        if cached is not None:
+            return cached
+        old = gdi32.SelectObject(dc, font)
+        size = SIZE()
+        ws: dict[str, int] = {}
+        for d in "0123456789":
+            gdi32.GetTextExtentPoint32W(dc, d, 1, ctypes.byref(size))
+            ws[d] = size.cx
+        gdi32.SelectObject(dc, old)
+        self._digit_w[font] = ws
+        return ws
+
+    def _text_width(self, dc, text: str, font) -> int:
+        """量文本宽度，但所有数字按「最宽数字」计。
+
+        Microsoft YaHei UI 的数字是比例宽度（'1' 明显比 '0' 窄），长条又是按内容
+        自适应宽度的，于是实时功率一变（101 W ↔ 115 W）整条就跟着改宽、左边缘左右
+        跳 15px，看起来像在抖。把数字统一按最宽算，宽度就与具体数值无关了。
+        """
+        if not any("0" <= ch <= "9" for ch in text):
+            return self._raw_text_width(dc, text, font)
+        ws = self._digit_widths(dc, font)
+        widest = max(ws.values())
+        extra = sum(widest - ws[ch] for ch in text if "0" <= ch <= "9")
+        return self._raw_text_width(dc, text, font) + extra
 
     def _text(self, dc, text, x, y, w, h, font, color, align=DT_LEFT) -> None:
         old = gdi32.SelectObject(dc, font)

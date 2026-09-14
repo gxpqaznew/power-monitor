@@ -407,12 +407,16 @@ class PowerMonitorApp:
                 f"（{snap.power_on_source}）",
                 f"GPU：{gpu}",
                 f"CPU：{snap.cpu_source}（估算）",
-                "其他：主板 / 内存 / 存储 / 风扇 按经验常量计",
+                f"其他：主板 / 内存 / 存储 / 风扇 按常量 "
+                f"{self.cfg.baseline_watts:.0f} W 计",
+                *([f"校准：整机 ×{self.cfg.calibration:.2f}（对齐插座口径）"]
+                  if abs(self.cfg.calibration - 1.0) > 1e-9 else []),
                 f"电价：{self.cfg.tariff_region} · {self.cfg.tariff_plan}",
                 f"      峰段 {self.cfg.price_peak:.4f} · 平段 {self.cfg.price_flat:.4f} · "
                 f"谷段 {self.cfg.price_valley_dry:.4f} 元/度",
                 f"      数据来源：{self.cfg.tariff_source}",
-                "      各地电价不一样，可以右键托盘图标 →「电价设置…」改。",
+                "      各地电价不一样，可以右键托盘图标 →「电价设置…」改；",
+                "      功耗模型（其他功耗 / 显示器 / 校准系数）也在同一个窗口里。",
                 "",
                 f"配置文件：{CONFIG_PATH}",
             ]

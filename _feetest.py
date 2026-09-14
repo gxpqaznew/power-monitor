@@ -32,6 +32,9 @@ IDC = {
     "months": 122,
     "note": 130,
     "source": 131,
+    "base": 162,
+    "monitor": 163,
+    "calib": 164,
 }
 
 CB_GETCOUNT = 0x0146
@@ -97,7 +100,7 @@ def main() -> int:
     print("\n[1] 建窗口")
     check("窗口创建成功", dlg.create(), True)
     check("拿到窗口句柄", bool(dlg.hwnd), True)
-    check("控件都建出来了", len(dlg._controls), 27)
+    check("控件都建出来了", len(dlg._controls), 34)
 
     print("\n[2] 打开时定位到当前配置（默认四川·第一档）")
     check("省份下拉框选中四川", dlg._selected_region().name, "四川")
@@ -109,6 +112,9 @@ def main() -> int:
     check("谷段时段填入", dlg._text(IDC["valley_hours"]), "23-7")
     check("峰段时段为空", dlg._text(IDC["peak_hours"]), "")
     check("丰水期月份填入", dlg._text(IDC["months"]), "6,7,8,9,10")
+    check("其他功耗填入", dlg._text(IDC["base"]), "35")
+    check("显示器功耗默认 0（未计入）", dlg._text(IDC["monitor"]), "0")
+    check("校准系数默认 1.00", dlg._text(IDC["calib"]), "1.00")
 
     print("\n[2b] 下拉框里存的确实是中文（防野指针）")
     check("省份项数 = 30 省 + 1 自定义", combo_count(dlg, IDC["region"]), len(tariffs.REGIONS) + 1)
@@ -179,6 +185,32 @@ def main() -> int:
     check("方案=手动填写", cfg.tariff_plan, CUSTOM_PLAN_LABEL)
     check("价格保留不动", cfg.price_peak, 0.61)
     check("来源=用户手动设置", cfg.tariff_source, "用户手动设置")
+
+    print("\n[9] 功耗模型：其他功耗 / 显示器 / 校准系数 可调")
+    dlg3 = FeeSettingsDialog(cfg, on_saved=None)
+    check("重新创建", dlg3.create(), True)
+    dlg3._set_text(IDC["base"], "45")
+    dlg3._set_text(IDC["monitor"], "32")
+    dlg3._set_text(IDC["calib"], "1.15")
+    dlg3._save()
+    check("其他功耗=45", cfg.baseline_watts, 45.0)
+    check("显示器功耗=32", cfg.monitor_watts, 32.0)
+    check("计入显示器=True", cfg.include_monitor, True)
+    check("校准系数=1.15", cfg.calibration, 1.15)
+    check("config.json 含校准", '"calibration": 1.15' in
+          config_mod.CONFIG_PATH.read_text(encoding="utf-8"), True)
+
+    print("\n[10] 重开窗口 → 功耗模型还原；显示器填 0 = 不计入")
+    dlg4 = FeeSettingsDialog(cfg, on_saved=None)
+    check("重新创建", dlg4.create(), True)
+    check("其他功耗还原", dlg4._text(IDC["base"]), "45")
+    check("显示器还原", dlg4._text(IDC["monitor"]), "32")
+    check("校准还原", dlg4._text(IDC["calib"]), "1.15")
+    dlg4._set_text(IDC["monitor"], "0")
+    dlg4._save()
+    check("显示器=0 视为不计入", cfg.include_monitor, False)
+    check("原瓦数保留备用", cfg.monitor_watts, 32.0)
+    dlg4.destroy()
 
     dlg2.destroy()
     print(f"\n共 {checks} 项，失败 {len(failures)} 项")

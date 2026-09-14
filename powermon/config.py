@@ -83,6 +83,10 @@ class Config:
     # 是否把显示器功耗计入（显示器一般独立计量，默认不计）
     include_monitor: bool = False
     monitor_watts: float = 30.0
+    # 整机校准系数：把「软件估算（机箱内直流口径）」换算到「插座读数（交流口径）」。
+    # CPU 模型偏差与电源转换损耗都是系统性偏小，一个系数一起吸收最省事。
+    # 用智能插座/功率计实测后，按 实测值 ÷ 软件值 填。1.0 = 不校准。
+    calibration: float = 1.0
 
     @classmethod
     def load(cls) -> "Config":

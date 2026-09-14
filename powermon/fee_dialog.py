@@ -87,6 +87,7 @@ IDC_HINT = 90
 IDC_HEAD1 = 91
 IDC_HEAD2 = 92
 IDC_HEAD3 = 93
+IDC_HEAD4 = 94
 IDC_REGION = 100
 IDC_PLAN = 101
 IDC_PEAK = 110
@@ -110,6 +111,12 @@ IDC_LBL_WET = 155
 IDC_LBL_PEAK_HOURS = 156
 IDC_LBL_VALLEY_HOURS = 157
 IDC_LBL_WET_MONTHS = 158
+IDC_LBL_BASE = 159
+IDC_LBL_MONITOR = 160
+IDC_LBL_CALIB = 161
+IDC_BASE = 162
+IDC_MONITOR = 163
+IDC_CALIB = 164
 
 CUSTOM_LABEL = "— 自定义（不套用预设）—"
 CUSTOM_PLAN_LABEL = "手动填写"
@@ -144,6 +151,20 @@ def _parse_price(text: str, label: str) -> float:
     if value > 10:
         raise ValueError(f"「{label}」是 {value} 元/度，明显偏高——请确认没写错（应为元/度）。")
     return round(value, 6)
+
+
+def _parse_num(text: str, label: str, lo: float, hi: float, unit: str = "") -> float:
+    """解析一个带范围校验的数字（功耗 / 系数）。"""
+    raw = (text or "").strip().replace("W", "").replace("w", "").replace("瓦", "")
+    if not raw:
+        raise ValueError(f"「{label}」不能为空。不需要就填 0。")
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"「{label}」的“{text.strip()}”不是合法数字。") from None
+    if not (lo <= value <= hi):
+        raise ValueError(f"「{label}」应在 {lo:g} ~ {hi:g}{unit} 之间，填的是 {value:g}。")
+    return value
 
 
 def _parse_hours(text: str, label: str) -> str:
@@ -232,7 +253,7 @@ class FeeSettingsDialog:
         self._plan_index: list[Plan | None] = []
         self.scale = 1.0
         self.client_w = 470
-        self.client_h = 400
+        self.client_h = 478
 
     # ------------------------------------------------------------- 尺寸
 
@@ -378,9 +399,15 @@ class FeeSettingsDialog:
         self._child(lbl, "谷段时段", SS_RIGHT, IDC_LBL_VALLEY_HOURS)
         self._child(lbl, "丰水期月份", SS_RIGHT, IDC_LBL_WET_MONTHS)
 
+        self._child(lbl, "功耗模型（瓦）", SS_LEFT, IDC_HEAD4, "head")
+        self._child(lbl, "其他功耗", SS_RIGHT, IDC_LBL_BASE)
+        self._child(lbl, "显示器功耗", SS_RIGHT, IDC_LBL_MONITOR)
+        self._child(lbl, "校准系数", SS_RIGHT, IDC_LBL_CALIB)
+
         edit_style = ES_LEFT | ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP
         for cid in (IDC_PEAK, IDC_FLAT, IDC_VALLEY_DRY, IDC_VALLEY_WET,
-                    IDC_PEAK_HOURS, IDC_VALLEY_HOURS, IDC_WET_MONTHS):
+                    IDC_PEAK_HOURS, IDC_VALLEY_HOURS, IDC_WET_MONTHS,
+                    IDC_BASE, IDC_MONITOR, IDC_CALIB):
             self._child(edit, "", edit_style, cid)
 
         self._child(lbl, "", SS_LEFT, IDC_NOTE, "small")
@@ -440,6 +467,16 @@ class FeeSettingsDialog:
         y += S(27)
         self._place(IDC_LBL_WET_MONTHS, lx, y + S(3), lw, S(20))
         self._place(IDC_WET_MONTHS, cx, y, ew, eh)
+        y += S(29)
+
+        self._place(IDC_HEAD4, m, y, inner, S(17)); y += S(21)
+        self._place(IDC_LBL_BASE, lx, y + S(3), lw, S(20))
+        self._place(IDC_BASE, cx, y, ew, eh)
+        self._place(IDC_LBL_MONITOR, col2, y + S(3), lw, S(20))
+        self._place(IDC_MONITOR, cx2, y, ew, eh)
+        y += S(27)
+        self._place(IDC_LBL_CALIB, lx, y + S(3), lw, S(20))
+        self._place(IDC_CALIB, cx, y, ew, eh)
         y += S(29)
 
         self._place(IDC_NOTE, m, y, inner, S(40)); y += S(44)
@@ -538,6 +575,10 @@ class FeeSettingsDialog:
         self._set_text(IDC_PEAK_HOURS, cfg.peak_hours or "")
         self._set_text(IDC_VALLEY_HOURS, cfg.valley_hours or "")
         self._set_text(IDC_WET_MONTHS, _fmt_months(cfg.valley_wet_months))
+        # 功耗模型：显示器填 0 就等同于「不计入」
+        self._set_text(IDC_BASE, f"{cfg.baseline_watts:.0f}")
+        self._set_text(IDC_MONITOR, f"{cfg.monitor_watts:.0f}" if cfg.include_monitor else "0")
+        self._set_text(IDC_CALIB, f"{cfg.calibration:.2f}")
 
     def _fill_fields_from_plan(self, plan: Plan) -> None:
         self._set_text(IDC_PEAK, _fmt_price(plan.peak))
@@ -602,6 +643,9 @@ class FeeSettingsDialog:
             peak_hours = _parse_hours(self._text(IDC_PEAK_HOURS), "峰段时段")
             valley_hours = _parse_hours(self._text(IDC_VALLEY_HOURS), "谷段时段")
             wet_months = _parse_months(self._text(IDC_WET_MONTHS), "丰水期月份")
+            base_w = _parse_num(self._text(IDC_BASE), "其他功耗", 0, 500, " W")
+            monitor_w = _parse_num(self._text(IDC_MONITOR), "显示器功耗", 0, 500, " W")
+            calib = _parse_num(self._text(IDC_CALIB), "校准系数", 0.5, 2.0)
         except ValueError as exc:
             user32.MessageBoxW(
                 self._hwnd, str(exc), "电价设置有误", MB_OK | MB_ICONWARNING
@@ -653,13 +697,20 @@ class FeeSettingsDialog:
         cfg.peak_hours = peak_hours
         cfg.valley_hours = valley_hours
         cfg.valley_wet_months = wet_months
+        # 显示器填 0 = 不计入（等价于关掉 include_monitor），保留原瓦数备用
+        cfg.baseline_watts = base_w
+        if monitor_w > 0:
+            cfg.monitor_watts = monitor_w
+        cfg.include_monitor = monitor_w > 0
+        cfg.calibration = calib
         cfg.save()
 
         _dbg(
             f"已保存 地区={cfg.tariff_region} 方案={cfg.tariff_plan} "
             f"峰={peak} 平={flat} 谷枯={dry} 谷丰={wet} "
             f"峰时段={peak_hours or '（无）'} 谷时段={valley_hours or '（无）'} "
-            f"丰水期={wet_months}"
+            f"丰水期={wet_months} ｜ 其他={base_w}W 显示器={monitor_w}W "
+            f"校准×{calib:.2f}"
         )
 
         if self._on_saved is not None:

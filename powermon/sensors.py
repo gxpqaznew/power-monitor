@@ -412,6 +412,15 @@ class SensorHub:
         if self._cfg.include_monitor:
             base_w += self._cfg.monitor_watts
 
+        # 整机校准：把「直流估算」换算到「插座口径」。CPU 模型误差 + 电源转换
+        # 损耗都是系统性偏小，用一个系数一起补掉最省事。三个分量同比缩放，
+        # 这样面板上的堆叠条加起来仍等于总值（不会出现「分项和≠合计」）。
+        k = self._cfg.calibration or 1.0
+        if k != 1.0:
+            cpu_w *= k
+            gpu_w *= k
+            base_w *= k
+
         return Reading(
             ts=time.time(),
             total_w=cpu_w + gpu_w + base_w,

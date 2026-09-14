@@ -1,0 +1,20 @@
+开机能耗统计 v1.0.0 自检
+frozen=False  python=3.13.14
+exe=C:\Users\gxp\.workbuddy\binaries\python\versions\3.13.12\python.exe
+
+[PASS] 内置省份电价预设已打进包  (30 个)
+[PASS] 时段解析可用（23-7 跨零点）
+[PASS] 四种图标显示模式都能算出文本  ({'current': '132', 'cost': '1.28', 'session': '428', 'average': '118'})
+[PASS] 电费模式按量级调精度  (0.32/12.4/103)
+[PASS] 图标文本不超过 4 个字符（放不下会被截断）  ({'current': 3, 'cost': 4, 'session': 3, 'average': 3})
+[PASS] 长条能排出 4 个字段
+[PASS] 长条宽度算得出来  (651px)
+[PASS] 长条内部 alpha 补满（没有透明空洞）  (651/651)
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=919)
+[PASS] 电价设置窗口能建出来
+[PASS] 省份项数 = 预设数 + 1 个自定义
+[PASS] 打开时定位到默认省份  (四川)
+[PASS] 下拉框第 1 项文字是「四川」  ('四川')
+[PASS] 方案下拉框有内容
+
+通过 14 项，失败 0 项

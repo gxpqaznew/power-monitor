@@ -1,0 +1,21 @@
+# 构建产物（二进制通过 GitHub Release 发布，不进仓库）
+build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行期日志与用户数据
+*.log
+state.json
+config.json
+debug.log
+
+# 离线渲染/截图的预览图
+_preview/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db

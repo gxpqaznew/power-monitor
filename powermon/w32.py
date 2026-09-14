@@ -512,6 +512,12 @@ user32.GetSysColorBrush.restype = wintypes.HBRUSH
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
 user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+# 长条嵌进任务栏：SetParent 成 Shell_TrayWnd 的子窗口，才不会被 explorer
+# 的置顶重排压下去（顶级 TOPMOST 窗口和任务栏抢 z 序必输，表现为长条一闪一闪）
+user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+user32.SetParent.restype = wintypes.HWND
+user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+user32.ClientToScreen.restype = wintypes.BOOL
 
 # --- gdi32 补充 ---
 gdi32.SetBkColor.argtypes = [wintypes.HDC, wintypes.DWORD]

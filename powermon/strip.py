@@ -56,6 +56,7 @@ from .w32 import (
     WS_EX_TOPMOST,
     WS_EX_TRANSPARENT,
     WS_POPUP,
+    WS_CHILD,
     gdi32,
     kernel32,
     user32,
@@ -127,6 +128,7 @@ class TaskbarStrip:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         self._hwnd = None
+        self._parent = None     # 嵌进任务栏后的父窗口（Shell_TrayWnd）
         self._fonts: dict[str, int] = {}
         self._brushes: dict[int, int] = {}
         self._pens: dict[tuple[int, int], int] = {}
@@ -190,12 +192,24 @@ class TaskbarStrip:
 
         _strips[self._hwnd] = self
         self._rect = target
+        self._parent = None
         self._topmost_at = 0.0
-        self._hidden = True          # 由第一次 tick 负责显示出来
+        self._hidden = True
+        # 先嵌进任务栏再显示，位置立刻按父窗口客户区坐标重排一次
+        self._embed_into_taskbar()
+        cl, ct, cr, cb = self._client_rect(target)
+        user32.SetWindowPos(
+            self._hwnd, None, cl, ct, cr - cl, cb - ct,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        )
         user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
         self._hidden = False
+        self._ensure_above_siblings(force=True)
         self._render_if_needed(snap)
-        debug.log("strip", f"创建成功 rect={target}")
+        if self._parent:
+            debug.log("strip", f"创建成功 rect={target} 已嵌入任务栏 parent={self._parent:#x}")
+        else:
+            debug.log("strip", f"创建成功 rect={target}（未嵌入，走置顶兜底）")
         return True
 
     def destroy(self) -> None:
@@ -518,6 +532,16 @@ class TaskbarStrip:
     def tick(self, snap) -> None:
         """每秒调一次：位置/尺寸变了就搬，内容变了就重画。"""
         if not self._hwnd:
+            # explorer 重启会把任务栏连着我们的子窗口一起带走：环境回来了就重建
+            if snap is not None and taskbar.taskbar() is not None:
+                self.create(snap)
+            if not self._hwnd:
+                return
+        elif not user32.IsWindow(self._hwnd):
+            # 句柄还挂着但窗口已经死了（异常情况），清干净下个 tick 再建
+            self._hwnd = None
+            self._rect = None
+            self._release_buffer()
             return
 
         if self._should_hide():
@@ -537,28 +561,58 @@ class TaskbarStrip:
             user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
             self._hidden = False
             self._key = None
-            # 刚从隐藏恢复，立刻把置顶重新声明一次，避免被任务栏压到下面
+            # 刚从隐藏恢复，立刻把层级重新声明一次，避免被任务栏压到下面
             # （否则会出现「消失一下、过两秒才冒出来」的错觉）。
-            self._ensure_topmost(force=True)
+            self._ensure_above_siblings(force=True)
 
         if target != self._rect:
-            left, top, right, bottom = target
+            cl, ct, cr, cb = self._client_rect(target)
             user32.SetWindowPos(
-                self._hwnd, None, left, top, right - left, bottom - top,
+                self._hwnd, None, cl, ct, cr - cl, cb - ct,
                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
             )
             self._rect = target
             self._key = None
             debug.log("strip", f"移动到 {target}")
 
-        self._ensure_topmost()
+        self._ensure_above_siblings()
         self._render_if_needed(snap)
 
-    def _ensure_topmost(self, force: bool = False) -> None:
-        """任务栏也是置顶窗口，explorer 重画时可能把长条压下去。
+    def _embed_into_taskbar(self) -> None:
+        """把自己 SetParent 成 Shell_TrayWnd 的**子窗口**。
 
-        定期重新声明一次置顶即可；不移动不改变大小，代价可以忽略。
-        ``force`` 用于刚恢复显示这种「必须立刻置顶」的场景。
+        顶级 TOPMOST 窗口和任务栏抢 z 序必输：explorer 会频繁把任务栏重新抬到
+        最前（Win11 的 XAML 任务栏尤其勤快，实测长条隔零点几秒就被压下去一次、
+        每 2 秒才抢回来一次，看起来就是「一闪一闪」）。变成任务栏的子窗口后
+        永远画在任务栏背景之上，这个争夺根本不存在（TrafficMonitor 同款做法）。
+        """
+        info = taskbar.taskbar()
+        if info is None:
+            return
+        bar_hwnd, _trect, _dpi = info
+        user32.ShowWindow(self._hwnd, 0)  # 改样式 / 换爹之前先藏起来
+        style = user32.GetWindowLongPtrW(self._hwnd, GWL_STYLE)
+        user32.SetWindowLongPtrW(
+            self._hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)
+        user32.SetParent(self._hwnd, bar_hwnd)
+        self._parent = bar_hwnd
+
+    def _client_rect(self, rect: tuple[int, int, int, int]):
+        """屏幕坐标 -> 父窗口客户区坐标（没嵌入时原样返回）。"""
+        if not self._parent:
+            return rect
+        pt = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(self._parent, ctypes.byref(pt)):
+            return rect
+        l, t, r, b = rect
+        return (l - pt.x, t - pt.y, r - pt.x, b - pt.y)
+
+    def _ensure_above_siblings(self, force: bool = False) -> None:
+        """维持长条的层级。
+
+        嵌入成功时：偶尔把自己抬到任务栏**子窗口**的最顶层（防 Win11 的
+        XAML 内容桥这类兄弟子窗口盖住自己）；没嵌入成功（兜底还是顶级
+        窗口）时：维持原来「定期重申 TOPMOST」的逻辑。
         """
         import time
 
@@ -566,10 +620,16 @@ class TaskbarStrip:
         if not force and now - self._topmost_at < 2.0:
             return
         self._topmost_at = now
-        user32.SetWindowPos(
-            self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-        )
+        if self._parent:
+            user32.SetWindowPos(
+                self._hwnd, 0, 0, 0, 0, 0,  # HWND_TOP：兄弟窗口里排最前
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        else:
+            user32.SetWindowPos(
+                self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
 
     def _should_hide(self) -> bool:
         """只有「任务栏真的看不到了」时才藏：自动隐藏且滑走、或独占全屏把任务栏盖住。
@@ -647,5 +707,8 @@ class TaskbarStrip:
             self._view, w, h, margin=0, radius=min(_RADIUS, h / 2.0),
             shape_w=w, shape_h=h, shadow=0,
         )
-        present_layered(self._hwnd, self._mem_dc, w, h, left, top)
+        # 子窗口的 UpdateLayeredWindow 位置是相对父窗口客户区的（和 SetWindowPos
+        # 同一套约定）；没嵌入时 _client_rect 原样返回屏幕坐标。
+        cl, ct, _cr, _cb = self._client_rect(self._rect)
+        present_layered(self._hwnd, self._mem_dc, w, h, cl, ct)
         self._key = key

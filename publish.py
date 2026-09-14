@@ -101,11 +101,25 @@ def build_installer() -> Path:
     return installer
 
 
-def _api_push(before: str, after: str, repo: str) -> bool:
+def _local_commit_for_tree(tree_sha: str) -> str | None:
+    """在本地 HEAD 历史里找 tree 与远端一致的提交（用于定位远端父提交的本地对应）。"""
+    out = subprocess.run(["git", "rev-list", "HEAD"], cwd=str(PROJECT),
+                         capture_output=True, text=True).stdout.split()
+    for sha in out:
+        t = subprocess.run(["git", "rev-parse", f"{sha}^{{tree}}"], cwd=str(PROJECT),
+                           capture_output=True, text=True).stdout.strip()
+        if t == tree_sha:
+            return sha
+    return None
+
+
+def _api_push(local_base: str, remote_base: str, after: str, repo: str) -> bool:
     """git push 失败时的兜底：走 api.github.com 的 Git Data API 重放提交。
 
     本机沙箱/代理只放通 api.github.com，github.com 的 CONNECT 会被 502，
     因此 git-over-HTTPS 推不上去；改用 API 建 blob→tree→commit→更新 ref。
+    local_base 是本地对应提交（用于算 rev-list 范围），
+    remote_base 是远端当前的父提交（API 造出来的提交本地往往没有）。
     """
     import base64
     import json
@@ -120,13 +134,13 @@ def _api_push(before: str, after: str, repo: str) -> bool:
             raise SystemExit(f"gh api {path} 失败:\n{p.stderr}")
         return json.loads(p.stdout) if p.stdout.strip() else {}
 
-    revs = subprocess.run(["git", "rev-list", "--reverse", f"{before}..{after}"],
+    revs = subprocess.run(["git", "rev-list", "--reverse", f"{local_base}..{after}"],
                           cwd=str(PROJECT), capture_output=True, text=True).stdout.split()
     if not revs:
         print("（没有新提交需要推送）")
         return True
     print(f"  兜底 API 推送 {len(revs)} 个提交…")
-    parent = before
+    parent = remote_base
     for rev in revs:
         msg = subprocess.run(["git", "log", "-1", "--format=%B", rev], cwd=str(PROJECT),
                              capture_output=True, text=True).stdout.strip()
@@ -176,16 +190,20 @@ def git_commit(ver: str, repo: str = DEFAULT_REPO) -> bool:
         return True
     print(f"（git push 失败：{p.stderr.strip().splitlines()[-1] if p.stderr.strip() else '未知'}）")
     print("  改用 api.github.com 兜底推送…")
-    # 远端 main 当前指向哪，就从哪开始重放
-    try:
-        base = subprocess.run(["gh", "api", f"repos/{repo}/commits/main", "-q", ".sha"],
-                              cwd=str(PROJECT), capture_output=True, text=True).stdout.strip()
-    except Exception:
-        base = ""
-    if not base:
+    # 远端 main 当前指向哪，就从哪开始重放；远端 sha 本地通常没有，
+    # 用「树哈希一致」反查对应的本地提交作为 rev-list 起点。
+    info = subprocess.run(["gh", "api", f"repos/{repo}/commits/main", "-q",
+                           '.sha + " " + .commit.tree.sha'],
+                          cwd=str(PROJECT), capture_output=True, text=True).stdout.strip()
+    if not info:
         print("  拿不到远端 main，跳过")
         return False
-    _api_push(base, head_after, repo)
+    remote_base, remote_tree = info.split()
+    local_base = _local_commit_for_tree(remote_tree)
+    if not local_base:
+        print(f"  远端 {remote_base[:7]} 的树在本地找不到对应提交，跳过兜底")
+        return False
+    _api_push(local_base, remote_base, head_after, repo)
     return True
 
 

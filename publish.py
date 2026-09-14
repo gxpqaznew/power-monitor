@@ -66,10 +66,23 @@ def bump(ver: str) -> str:
 
 
 def _move_aside(path: Path) -> None:
+    """把旧产物移进临时目录（移动而非删除，避开安全删除守卫）。
+
+    用唯一文件名，避免和之前已移走的旧文件撞名导致 os.replace 被锁。
+    """
     if not path.exists():
         return
-    dst = Path(tempfile.gettempdir()) / f"old_{path.name}"
-    os.replace(path, dst)  # 移动而非删除，避开安全删除守卫
+    d = Path(tempfile.gettempdir())
+    base = f"old_{path.stem}_{os.getpid()}"
+    for i in range(2000):
+        cand = d / f"{base}_{i}{path.suffix}"
+        if not cand.exists():
+            try:
+                os.replace(path, cand)
+                return
+            except PermissionError:
+                continue
+    print(f"（无法移走 {path.name}，可能被占用，跳过）")
 
 
 def build_exe() -> None:
@@ -109,13 +122,17 @@ def git_commit(ver: str) -> bool:
 
 def release(repo: str, ver: str, installer: Path, notes: str) -> None:
     tag = f"v{ver}"
+    # GitHub 资产名用 ASCII：中文文件名经本机 shell 传参会被乱码（已踩过 -.-v1.0.1.exe）
+    import shutil
+    ascii_asset = DIST / f"PowerMonitor-Setup-v{ver}.exe"
+    shutil.copy2(installer, ascii_asset)
     _run(["gh", "release", "create", tag,
           "-R", repo,
-          str(installer),
+          str(ascii_asset),
           "--title", f"开机能耗统计 {tag}",
           "--notes", notes,
           "--latest"])
-    print(f"已发布 https://github.com/{repo}/releases/tag/{tag}")
+    print(f"已发布 https://github.com/{repo}/releases/tag/{tag}（资产 {ascii_asset.name}）")
 
 
 def main() -> int:

@@ -85,12 +85,106 @@ _RADIUS = 999.0           # 足够大就会被夹成胶囊（= 高的一半）
 _LABEL_SZ = 13.0
 _VALUE_SZ = 20.0
 _UNIT_SZ = 12.0
-# 长条最宽多少（设计基准 48px 任务栏下的像素）。太宽会顶到任务栏中间的任务按钮，
-# 所以超了就按顺序从后往前丢字段。字号调大时按比例放宽 —— 字大了本来就需要更多地方。
-_MAX_WIDTH = 560.0
+# 长条宽度上限（设计基准 48px 任务栏下的像素）。
+#
+# ⚠️ 它**不是**「能显示几个字段」的主约束 —— 主约束是锚点左边的**实际可用宽度**
+# （屏幕左边 8px → 开始按钮左边，见 _target_rect 里的 available，本机有 1000+ px）。
+# 踩过的坑：这个常量原来取 560，被当成了真上限，于是用户勾了 6~8 个字段只显示出
+# 4 个，左边明明一大片空地 —— 从后往前丢字段的逻辑（_layout）看起来"正常工作"，
+# 所以从代码上完全看不出是这里卡住了。
+#
+# 现在它只是一条**雪崩线**：万一锚点算歪（比如开始按钮被挤到屏幕很右边），
+# 也不至于让长条铺满整条任务栏。
+_MAX_WIDTH = 2600.0
+# 兜底锚点（找不到开始按钮、退化成贴通知区域左边）时仍用老上限 560：
+# 那个位置往左就是中间那排任务图标，铺长了会盖住它们。
+_MAX_WIDTH_TRAY = 560.0
 # 少于这么多像素可用宽度就整条不显示：硬塞一两个字符进任务栏角落，比不显示更糟。
 # 取 108 是为了让「只勾一个字段」的最窄情况（约 130px）仍然显示得出来。
 _ABS_MIN_WIDTH = 108.0
+
+# --------------------------------------------------------------- 折行
+# 用户的原话是「勾了多少就该显示多少」。但单行装不下：本机任务栏 2560 宽、
+# 图标簇居中，长条左边（开始按钮往左）只有 883px 可用，一个字段约 126px
+# （scale 1.0）—— 单行物理上限就是 6~7 项。
+#
+# 所以一行放不下就**折行**：行高比单行矮一点，必要时字号自动降一档，
+# 让所有勾选的字段都排进去。只在需要时才折 —— 字段少的时候外观和以前完全一样。
+_MAX_ROWS = 3
+_ROW_H = 26.0                 # 单行行高基准（48px 任务栏基准下的 px）
+_MULTI_ROW_MAX_RATIO = 0.94   # 折行时胶囊最多占任务栏高度的比例
+# 折行时圆角要收小一些：高度都接近任务栏了，再按 height/2 画就成了一个巨型胶囊
+_MULTI_ROW_RADIUS_RATIO = 0.30
+# 文本宽度缓存上限（条数）。每秒都在出新数字，超了就整批清掉。
+_TEXT_WIDTH_CACHE = 4096
+
+# --------------------------------------------------------------- 密度档
+# 光靠折行还是不够塞：15 个字段连标签带数值一共要 ~1900px，两行只有 1690px。
+# 于是再给三档「密度」，从松到紧依次启用，**只在需要时才启用** ——
+# 字段少的时候必须走第 0 档，外观和加折行之前一模一样。
+#
+#   (短标签, 分隔间距倍数, 标签/单位间距倍数)
+#
+# 第 1 档换短标签（「本次电费」→「本次」，见 stripopts.SHORT_LABEL），
+# 第 2 档再把分隔和间隙收紧：每个分隔在 scale 1.25 下要 33px，15 个字段就是
+# 460px —— 这比一个字段还宽，挤的时候最该动它。
+# 分隔线本身还在（只是靠得近些），不会变成一坨连在一起的字。
+_DENSITY = (
+    (False, 1.00, 1.00),
+    (True, 1.00, 1.00),
+    (True, 0.40, 0.70),
+)
+
+# --------------------------------------------------------------- 规划占位值
+# 排「几行、哪档字号、哪档密度」时必须用**固定的**数值占位，不能用此刻的读数。
+#
+# 踩过的坑：一开始直接按真实数值算。结果 6 个字段时正好卡在 1 行 / 2 行的边界上 ——
+# 空闲 9 W 时单行、一跑起来 132 W 就要折行，于是字号在 1.00 和 0.85 之间来回弹、
+# 长条高度跟着在 47px 和 55px 之间跳。宽度有「数字按最宽算」的补偿撑着，
+# 但**数字的位数**是补偿不了的，而位数一变总宽就能差出 100 多像素。
+#
+# 所以规划时把数值换成下面这套占位（只影响排版，不参与绘制）：
+#   key -> (整数位下限, 小数位)
+# 于是「9 W」「132 W」「999 W」在规划眼里是同一个宽度，
+# 「1.00 kWh」「8.89 kWh」也是 —— 计划只由「勾了哪些字段 / 字号 / 尺寸 / 可用宽度」
+# 决定，读数怎么变都不动。真正跨越数量级的格式变化（Wh 变 kWh）例外，那是真的
+# 换了一种写法，重新规划是对的。
+_PLAN_NUMBER = {
+    "current": (3, 0), "cpu": (3, 0), "gpu": (3, 0), "base": (3, 0),
+    "avg": (3, 0), "peak": (3, 0),
+    "session": (3, 2), "today": (3, 2), "month": (3, 2), "total": (3, 2),
+    # 电费按两位数留（"¥99.99"）：日常账单就是这个量级；留三位的话光是这三个
+    # 字段白白多占 60px，够再挤下一个字段了（实测：改成两位之后，本机 863px
+    # 的可用宽度能重新放下全部 15 项）。真过了 ¥100 才需要重新规划一次。
+    "cost": (2, 2), "today_cost": (2, 2), "total_cost": (2, 2),
+}
+# 这几档的数值会在两种单位之间切换（Wh / kWh）。规划时一律按更长的那种（kWh）量，
+# 这样「428 Wh → 1.02 kWh」这一步也不会改排版计划。
+_PLAN_UNIT = {
+    "session": "kWh", "today": "kWh", "month": "kWh", "total": "kWh",
+}
+
+
+def _plan_cell(key: str, value: str, unit: str) -> tuple[str, str]:
+    """把一个字段折算成「规划用」的 (数值, 单位)。没有配占位的字段原样返回。"""
+    digits = _PLAN_NUMBER.get(key)
+    if digits is None:
+        return value, unit
+    # 数值可能带货币前缀（"¥0.32"）—— 前缀原样留着，只把数字部分换成占位
+    cut = 0
+    while cut < len(value) and not value[cut].isdigit():
+        cut += 1
+    prefix, number = value[:cut], value[cut:]
+    whole, _dot, _frac = number.partition(".")
+    if not whole.isdigit():
+        return value, unit
+    placeholder = "9" * max(digits[0], len(whole))
+    if digits[1]:
+        # 小数位**不看当前值有没有小数点**：电量字段在 Wh 段是整数（"428"）、
+        # 进了 kWh 段才有小数（"1.02"）。跟着实际格式走的话，这俩的占位宽度就
+        # 不一样，Wh→kWh 那一步照样会改排版计划。
+        placeholder += "." + "9" * digits[1]
+    return prefix + placeholder, _PLAN_UNIT.get(key, unit)
 
 _strips: dict[int, "TaskbarStrip"] = {}
 _strip_proc_ref: WNDPROC | None = None
@@ -268,6 +362,17 @@ class TaskbarStrip:
         # 宽度上限（像素）。开始按钮被运行中的程序挤到左边时，能用的地方会变小，
         # 这时候按上限丢字段；量宽和绘制必须用同一个上限。
         self._limit = 0
+        # 这一帧锚在哪儿（"start" 贴开始按钮 / "tray" 贴通知区域）。
+        # 只影响 _width_cap 的雪崩线取哪一档，见那边的注释。
+        self._anchor_kind = "start"
+        # ---- 折行 ----
+        # 高度预算：折行最多能把胶囊撑到多高（由 _target_rect 按任务栏高度算）。
+        # 量宽和绘制都读它，保证「量的时候 1 行、画的时候 2 行」这种错位不会发生。
+        self._max_height = 0
+        self._plan_rows = 1        # 这一帧排了几行
+        self._plan_height = 0      # 这一帧需要多高（_target_rect 拿它定窗口大小）
+        self._radius = 0           # 这一帧用的圆角（多行时会收小）
+        self._tw: dict[tuple, int] = {}   # 文本宽度缓存，见 _raw_text_width
 
     # ------------------------------------------------------------- 生命周期
 
@@ -410,10 +515,24 @@ class TaskbarStrip:
         user32.FillRect(dc, ctypes.byref(rect), self._brush(color))
 
     def _raw_text_width(self, dc, text: str, font) -> int:
+        """量文本宽度（带缓存）。
+
+        缓存不是可有可无的优化：选「排几行」要对同一批字段在几个字号下各量一遍，
+        而 GDI 的 GetTextExtentPoint32W 每次都要重新排版。没有缓存时每秒光量宽
+        就要上千次调用。文本内容每秒都在变（功率数字），所以缓存设了上限，
+        超了整批清掉，不会无限长。
+        """
+        key = (font, text)
+        cached = self._tw.get(key)
+        if cached is not None:
+            return cached
+        if len(self._tw) > _TEXT_WIDTH_CACHE:
+            self._tw.clear()
         old = gdi32.SelectObject(dc, font)
         size = SIZE()
         gdi32.GetTextExtentPoint32W(dc, text, len(text), ctypes.byref(size))
         gdi32.SelectObject(dc, old)
+        self._tw[key] = size.cx
         return size.cx
 
     def _digit_widths(self, dc, font) -> dict[str, int]:
@@ -458,13 +577,15 @@ class TaskbarStrip:
 
     # ------------------------------------------------------------- 内容
 
-    def _sections(self, snap) -> list[tuple[str, str, str, str]]:
+    def _sections(self, snap, compact: bool = False) -> list[tuple[str, str, str, str]]:
         """要显示的字段（key, 标签, 数值, 单位）。
 
         顺序完全由用户在「长条显示内容」里定的顺序决定，宽度不够时从后往前丢 ——
         所以靠后的字段是「有余量才显示」的那些。
+
+        ``compact=True`` 换两字短标签，只在折行 + 挤不下时才由 ``_plan`` 启用。
         """
-        return stripopts.sections(snap, self.cfg)
+        return stripopts.sections(snap, self.cfg, compact=compact)
 
     def _style_key(self) -> tuple:
         """只跟「长条长什么样」有关的键。
@@ -522,15 +643,20 @@ class TaskbarStrip:
         bar_h = bar_bottom - bar_top
         scale = bar_h / _NOMINAL_TASKBAR_H
         self._scale = scale
-        # 胶囊高度由「尺寸」档位决定，字号大了再往上抬一点（大了要更多行高，
+        # 单行高度由「尺寸」档位决定，字号大了再往上抬一点（大了要更多行高，
         # 否则字会被上下切掉）。默认档 = 0.78，和以前一样。
-        height = max(18, int(round(bar_h * stripopts.height_ratio(self.cfg))))
-        top = bar_top + (bar_h - height) // 2
+        base_height = max(18, int(round(bar_h * stripopts.height_ratio(self.cfg))))
+        # 折行时允许长高（最多到任务栏的 0.94），但不会比单行矮 ——
+        # 「尺寸」档位依然是单行时的外观契约，不会被折行偷偷改掉。
+        self._max_height = max(base_height,
+                               int(round(bar_h * _MULTI_ROW_MAX_RATIO)))
 
         screen = taskbar.screen_rect()
         gap = int(round(16 * scale))
 
         anchor = None
+        # 用的是哪个锚点，决定宽度上限走哪一档（见 _width_cap）
+        kind = "start"
         if self.cfg.strip_position == "start":
             anchor = taskbar.cluster_left()      # 贴着开始按钮左边
         if anchor is None:
@@ -538,11 +664,15 @@ class TaskbarStrip:
             if tray is None:
                 return None
             anchor = tray[0]                     # 兜底：贴通知区域左边
+            kind = "tray"
+        self._anchor_kind = kind
 
         right = anchor - gap
-        # 能用的宽度 = 从屏幕左边留 8px 到锚点左边。任务栏左对齐、或者同时开了
-        # 一堆程序把开始按钮挤到很左边时，这里会很小 —— 那种情况就按这个上限
-        # 少显示几个字段，而不是整条消失（整条消失用户会以为功能坏了）。
+        # 能用的宽度 = 从屏幕左边留 8px 到锚点左边 —— **这才是真正的上限**。
+        # 开始按钮在 Win11 是居中偏左那一簇的左端，它左边通常是整条空任务栏，
+        # 所以这里往往有上千像素，够显示十几个字段。任务栏改左对齐、或者同时开了
+        # 一堆程序把开始按钮挤到很左边时，这里会变小 —— 那种情况就按这个上限少显示
+        # 几个字段，而不是整条消失（整条消失用户会以为功能坏了）。
         available = right - (screen[0] + 8)
         if available < int(round(_ABS_MIN_WIDTH * scale)):
             return None
@@ -552,6 +682,17 @@ class TaskbarStrip:
         if width <= 0:
             return None
 
+        # 高度取「量宽那一步算出来的行数」需要的高度 —— 字段少就跟以前一样高，
+        # 勾得多了才长高折行。上限就是上面那条 _max_height。
+        #
+        # 取整放在这里（而不是等到拼矩形时）是为了让窗口高度是个整数：
+        # 绘制那边 `_layout` 拿 `height` 当画布高度，半个像素的零头会让
+        # 描边和 alpha 遮罩差一行，边缘上就会出现一条毛边。
+        height = int(round(max(base_height, min(self._plan_height or base_height,
+                                                self._max_height))))
+        # strip_position 的兜底锚点比 start 矮一点也无所谓，这里统一居中
+        top = bar_top + (bar_h - height) // 2
+
         left = right - width
         # 左边放不下（上面已经按 available 缩过，走不到这儿；留个保险）
         if left < screen[0] + 8:
@@ -559,14 +700,19 @@ class TaskbarStrip:
         return (int(left), int(top), int(right), int(top + height))
 
     def _width_cap(self, scale: float) -> float:
-        """长条宽度上限（像素）。
+        """雪崩线：长条最多能到多宽（像素）。
+
+        真正的上限是 ``_target_rect`` 里按当前任务栏布局实测出来的 ``available``，
+        这里只是防止锚点算歪时长条无限铺开。贴开始按钮时放得很宽（左边整条都是
+        空的），退化成贴通知区域时保守一些（往左就是那排任务图标）。
 
         字号调大时内容本来就变宽，上限必须跟着放宽 —— 否则大字号下会有一两个
         字段被从后往前砍掉，用户会觉得「把字调大反而少显示了一项」。小字号不
         收缩上限：内容本来就窄、够不到上限，缩了只是白白少一份余量。
         """
+        base = _MAX_WIDTH_TRAY if self._anchor_kind == "tray" else _MAX_WIDTH
         font_mult = max(1.0, stripopts.font_scale(self.cfg))
-        return _MAX_WIDTH * scale * font_mult
+        return base * scale * font_mult
 
     def _measure_width(self, scale: float, snap) -> int:
         """先算需要多宽。用一个临时 DC 量字宽即可。"""
@@ -592,80 +738,302 @@ class TaskbarStrip:
         布局代码算，不会出现「量的时候 3 段、画的时候 4 段」这种错位。
         顺带返回配色，是为了让调用方（``_render_if_needed``）拿到 ``alpha`` /
         ``key`` 再透传给 ``compose_shape_alpha`` —— 半透明与抠色两种质感都得靠它。
+
+        **折行**：一行排不下所有勾选的字段时就往上加行（最多 ``_MAX_ROWS`` 行），
+        必要时把字号降一档换高度。行数只由「字段、可用宽度、可用的最大高度」
+        决定，跟传进来的 ``height`` 无关 —— 量宽和绘制两条路径因此必然得到
+        同一个计划，画出来的东西和窗口大小严丝合缝。
+
+        间距（标签间隙 / 单位间隙 / 分隔宽度）也由计划给出，不再在这里算：
+        挤的时候 ``_plan`` 会收紧它们，量宽和绘制必须用同一套值。
         """
-        font_scale = stripopts.font_scale(self.cfg)
+        limit = self._limit or int(round(self._width_cap(scale)))
+        max_height = self._max_height or max(height, 0)
+
+        plan = self._plan(dc, snap, scale, limit, max_height)
+        rows = plan["rows"]
+        fonts = plan["fonts"]
+        gap_label = plan["gap_label"]
+        gap_unit = plan["gap_unit"]
+        div_margin = plan["div_margin"]
+
         pad_mult = stripopts.size_spec(self.cfg)[1]
         pad_x = _PAD_X * scale * pad_mult
-        gap_label = _GAP_LABEL * scale
-        gap_unit = _GAP_UNIT * scale
-        div_margin = _DIV_MARGIN * scale
 
-        # 字体缓存键必须带上字号倍率：同一个 scale 下换了字号就是另一套字体，
-        # 只按 scale 缓存会拿回旧尺寸的字体，现象就是「调了字号没反应」。
-        fkey = f"{scale:.3f}x{font_scale:.2f}"
-        label_font = self._font(f"lbl{fkey}", _LABEL_SZ * scale * font_scale)
-        value_font = self._font(f"val{fkey}", _VALUE_SZ * scale * font_scale, bold=True)
-        unit_font = self._font(f"unt{fkey}", _UNIT_SZ * scale * font_scale)
-
-        sections = self._sections(snap)
-        limit = self._limit or int(round(self._width_cap(scale)))
-        while len(sections) > 2:
-            total = self._sections_width(
-                dc, sections, pad_x, gap_label, gap_unit, div_margin,
-                label_font, value_font, unit_font,
-            )
-            if total <= limit:
-                break
-            sections.pop()
-
-        total = self._sections_width(
-            dc, sections, pad_x, gap_label, gap_unit, div_margin,
-            label_font, value_font, unit_font,
-        )
+        width = int(round(
+            pad_x * 2 + max((self._row_width(dc, row, gap_label, gap_unit,
+                                            div_margin, fonts)
+                             for row in rows), default=0)
+        ))
+        row_h = plan["row_h"]
+        content_h = max(int(round(row_h * len(rows))), 1)
+        # 画布高度 = **窗口高度**（`_target_rect` 按 base_height / 内容高度算好的），
+        # 内容多条时再按 content_h 铺满。
+        #
+        # 这里踩过坑：折行改造时一度把画布高度写成 content_h（= 行高 × 行数）。
+        # 单行时 content_h 只有 32.5px，而窗口是 47px 高的胶囊 —— 于是底色和描边
+        # 只画了上面 32.5px，下面 14.5px 是没填过的黑底色，叠上半透明就成了一条
+        # 黑带。窗口高度才是权威：画布永远占满它，几行内容在画布里**垂直居中**，
+        # 这样单行时的观感和老版本逐像素一致。
+        canvas_h = max(height, content_h) if height > 0 else content_h
+        band_top = origin_y + (canvas_h - content_h) / 2.0
+        self._plan_rows = len(rows)
+        self._plan_height = content_h
         if not render:
-            return total, 0, None
+            return width, canvas_h, None
 
         # ---- 配色：由「质感」档位决定，固定色调的档位不需要采样任务栏 ----
-        pal = self._resolve_palette(total, height, origin_x, origin_y)
-        radius = height / 2.0
-        self._fill(dc, origin_x, origin_y, total, height, pal["bg"])
+        pal = self._resolve_palette(width, canvas_h, origin_x, origin_y)
+        if len(rows) == 1:
+            radius = canvas_h / 2.0
+        else:
+            radius = min(canvas_h / 2.0, canvas_h * _MULTI_ROW_RADIUS_RATIO)
+        self._radius = radius
+        self._fill(dc, origin_x, origin_y, width, canvas_h, pal["bg"])
         # 高光必须在画文字**之前**铺，否则会把刚画上去的字一起洗白。
         if pal["highlight"] is not None:
-            self._highlight(total, height, origin_x, origin_y, pal["highlight"])
+            self._highlight(width, canvas_h, origin_x, origin_y, pal["highlight"])
         # 描边用 RoundRect 的**空心**画笔勾。RoundRect 会用当前画刷填充内部，
         # 如果这里选实心刷会把刚铺好的底色整块盖掉，所以必须用 NULL_BRUSH。
         old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
         old_pen = gdi32.SelectObject(dc, self._pen(pal["border"], pal["border_w"]))
-        gdi32.RoundRect(dc, origin_x, origin_y, origin_x + total, origin_y + height,
-                        int(radius * 2), int(radius * 2))
+        gdi32.RoundRect(dc, origin_x, origin_y, origin_x + width,
+                        origin_y + canvas_h, int(radius * 2), int(radius * 2))
         gdi32.SelectObject(dc, old_pen)
         gdi32.SelectObject(dc, old_brush)
 
-        # ---- 各段 ----
-        x = origin_x + pad_x
-        mid = origin_y + height / 2.0
-        for i, (_key, label, value, unit) in enumerate(sections):
-            w_label = self._text_width(dc, label, label_font)
-            w_value = self._text_width(dc, value, value_font)
-            w_unit = self._text_width(dc, unit, unit_font) if unit else 0
+        # ---- 逐行逐段 ----
+        for index, row in enumerate(rows):
+            top = band_top + row_h * index
+            x = origin_x + pad_x
+            mid = top + row_h / 2.0
+            for i, (_key, label, value, unit) in enumerate(row):
+                fonts_for = fonts
+                w_label = self._text_width(dc, label, fonts_for["label"])
+                w_value = self._text_width(dc, value, fonts_for["value"])
+                w_unit = (self._text_width(dc, unit, fonts_for["unit"])
+                          if unit else 0)
 
-            self._text(dc, label, x, origin_y, w_label + 2, height, label_font,
-                       pal["dim"])
-            x += w_label + gap_label
-            self._text(dc, value, x, origin_y, w_value + 2, height, value_font,
-                       pal["ink"])
-            x += w_value
+                self._text(dc, label, x, top, w_label + 2, row_h,
+                           fonts_for["label"], pal["dim"])
+                x += w_label + gap_label
+                self._text(dc, value, x, top, w_value + 2, row_h,
+                           fonts_for["value"], pal["ink"])
+                x += w_value
+                if unit:
+                    x += gap_unit
+                    self._text(dc, unit, x, top, w_unit + 2, row_h,
+                               fonts_for["unit"], pal["unit"])
+                    x += w_unit
+                if i < len(row) - 1:
+                    x += div_margin
+                    div_h = row_h * 0.46
+                    self._fill(dc, x, mid - div_h / 2, max(1, scale), div_h,
+                               pal["div"])
+                    x += max(1, scale) + div_margin
+        return width, canvas_h, pal
+
+    # ------------------------------------------------------------- 折行计划
+
+    def _fonts_for(self, scale: float, font_scale: float) -> dict:
+        # 字体缓存键必须带上字号倍率：同一个 scale 下换了字号就是另一套字体，
+        # 只按 scale 缓存会拿回旧尺寸的字体，现象就是「调了字号没反应」。
+        fkey = f"{scale:.3f}x{font_scale:.2f}"
+        return {
+            "label": self._font(f"lbl{fkey}", _LABEL_SZ * scale * font_scale),
+            "value": self._font(f"val{fkey}", _VALUE_SZ * scale * font_scale,
+                                bold=True),
+            "unit": self._font(f"unt{fkey}", _UNIT_SZ * scale * font_scale),
+        }
+
+    def _row_height(self, scale: float, font_scale: float) -> float:
+        """一行要多高。比字号略大一点，否则两行的字会贴在一起。"""
+        return _ROW_H * scale * font_scale
+
+    def _pack(self, dc, sections, budget, gap_label, gap_unit, div_margin,
+              fonts, planning: bool = True) -> list[list[tuple]]:
+        """把字段按可用宽度贪心折成若干行。
+
+        ``budget`` 是「一行能用的内容宽度」（已经减掉左右内边距）。单独一个字段
+        就超预算时它会独占一行 —— 宁可让它略微出格，也不要静默丢掉用户勾的项。
+
+        ``planning=True`` 时数值按固定占位量（见 ``_plan_cell``），这样「排几行」
+        不会跟着读数变。
+        """
+        rows: list[list[tuple]] = []
+        current: list[tuple] = []
+        for section in sections:
+            trial = current + [section]
+            if current and self._row_width(dc, trial, gap_label, gap_unit,
+                                           div_margin, fonts,
+                                           planning=planning) > budget:
+                rows.append(current)
+                current = [section]
+            else:
+                current = trial
+        if current:
+            rows.append(current)
+        return rows
+
+    def _row_width(self, dc, row, gap_label, gap_unit, div_margin, fonts,
+                   planning: bool = False) -> int:
+        """一行内容占多宽（不含左右内边距）。
+
+        ``planning=True`` 用占位数值（排版决策）；默认用真实数值（定窗口宽度）。
+        """
+        total = 0.0
+        for i, (key, label, value, unit) in enumerate(row):
+            if planning:
+                value, unit = _plan_cell(key, value, unit)
+            total += self._text_width(dc, label, fonts["label"])
+            total += gap_label
+            total += self._text_width(dc, value, fonts["value"])
             if unit:
-                x += gap_unit
-                self._text(dc, unit, x, origin_y, w_unit + 2, height, unit_font,
-                           pal["unit"])
-                x += w_unit
-            if i < len(sections) - 1:
-                x += div_margin
-                div_h = height * 0.46
-                self._fill(dc, x, mid - div_h / 2, max(1, scale), div_h, pal["div"])
-                x += max(1, scale) + div_margin
-        return total, height, pal
+                total += gap_unit + self._text_width(dc, unit, fonts["unit"])
+            if i < len(row) - 1:
+                total += div_margin * 2 + 1
+        return int(round(total))
+
+    def _fit_rows(self, dc, sections, budget, rows_wanted, gap_label, gap_unit,
+                  div_margin, fonts) -> list[tuple]:
+        """在「最多 rows_wanted 行」的约束下，从后往前丢字段，返回排得下的前缀。
+
+        只用于「怎么都塞不下」的兜底：先尽量多排，而不是一上来就退回单行。
+        丢永远从**末尾**丢（末尾是「有余量才显示」的字段），长条左边的读数不会
+        因为勾得多而改变位置 —— 用户的眼睛盯着的就是最左边那几个数。
+        """
+        shown = list(sections)
+        while len(shown) > 1:
+            rows = self._pack(dc, shown, budget, gap_label, gap_unit,
+                              div_margin, fonts)
+            if len(rows) <= rows_wanted:
+                return shown
+            shown.pop()
+        return shown
+
+    def _plan(self, dc, snap, scale: float, limit: int, max_height: int) -> dict:
+        """决定「排几行、用哪档字号、要不要换短标签 / 收紧间距」。
+
+        偏好顺序（先来的优先）：
+
+        1. **保持用户选的字号、单行、原样标签** —— 字段少的时候外观跟以前一模一样；
+        2. 保持字号、折成 2~3 行（高度够的话）；
+        3. 逐档降字号（最大 → 小）再折行；
+        4. 还是排不下就换短标签（第 1 档密度）重来一遍；
+        5. 再收紧分隔间距（第 2 档密度）重来一遍；
+        6. 全部试完仍塞不下，才从后往前丢字段，并且**尽量少丢**。
+
+        单行时**绝不**自动降字号：用户点了「巨大」就该是巨大，哪怕因此少显示
+        几项 —— 否则「调字号没反应」比「少显示一项」更让人费解。同理，第 0 档
+        密度是外观契约，只有前面全部失败才会动到标签和间距。
+        """
+        base_font = stripopts.font_scale(self.cfg)
+        smaller = [v for v in reversed(stripopts.FONT_SCALE_VALUES) if v < base_font]
+        pad_mult = stripopts.size_spec(self.cfg)[1]
+        pad_x = _PAD_X * scale * pad_mult
+        budget = max(1, limit - int(round(pad_x * 2)))
+
+        def max_rows_for(font_scale: float) -> int:
+            row_h = self._row_height(scale, font_scale)
+            if max_height <= 0:
+                return 1
+            return max(1, min(_MAX_ROWS, int(max_height // row_h)))
+
+        # (行数上限, 字号) 候选，按偏好排序
+        candidates: list[tuple[int, float]] = [(1, base_font)]
+        for rows in range(2, _MAX_ROWS + 1):
+            for font_scale in [base_font] + smaller:
+                candidates.append((rows, font_scale))
+        for rows in range(1, _MAX_ROWS + 1):
+            for font_scale in smaller:
+                candidates.append((rows, font_scale))
+
+        cache: dict[bool, list] = {}
+
+        def sections_for(compact: bool):
+            if compact not in cache:
+                cache[compact] = self._sections(snap, compact=compact)
+            return cache[compact]
+
+        def attempt(compact, div_mult, gap_mult, rows_wanted, font_scale,
+                    density_index):
+            sections = sections_for(compact)
+            gap_label = _GAP_LABEL * scale * gap_mult
+            gap_unit = _GAP_UNIT * scale * gap_mult
+            div_margin = _DIV_MARGIN * scale * div_mult
+            fonts = self._fonts_for(scale, font_scale)
+            rows = self._pack(dc, sections, budget, gap_label, gap_unit,
+                              div_margin, fonts)
+            return {
+                "rows": rows,
+                "font_scale": font_scale,
+                "row_h": self._row_height(scale, font_scale),
+                "fonts": fonts,
+                "gap_label": gap_label,
+                "gap_unit": gap_unit,
+                "div_margin": div_margin,
+                "placed": sum(len(r) for r in rows),
+                "total": len(sections),
+                "density": density_index,
+                "compact": compact,
+            }
+
+        # ---- 第一遍：按偏好顺序找「第一个能把所有字段排下」的方案 ----
+        for index, (compact, div_mult, gap_mult) in enumerate(_DENSITY):
+            for rows_wanted, font_scale in candidates:
+                if rows_wanted > max_rows_for(font_scale):
+                    continue
+                # 第 0 档的「单行 + 用户字号」是外观契约，不许换标签 / 收紧间距
+                if index and rows_wanted == 1 and font_scale == base_font:
+                    continue
+                plan = attempt(compact, div_mult, gap_mult, rows_wanted,
+                               font_scale, index)
+                if len(plan["rows"]) <= rows_wanted:
+                    return plan
+
+        # ---- 第二遍：怎么都塞不下，选「丢得最少」的那个方案 ----
+        # 遍历顺序仍是「从松到紧」，用严格大于比较，所以丢得一样多时先出现的
+        # （也就是外观改动最小的那一档）胜出。
+        best = None
+        for index, (compact, div_mult, gap_mult) in enumerate(_DENSITY):
+            sections = sections_for(compact)
+            if not sections:
+                continue
+            for rows_wanted, font_scale in candidates:
+                if rows_wanted > max_rows_for(font_scale):
+                    continue
+                if index and rows_wanted == 1 and font_scale == base_font:
+                    continue
+                shown = self._fit_rows(
+                    dc, sections, budget, rows_wanted,
+                    _GAP_LABEL * scale * gap_mult, _GAP_UNIT * scale * gap_mult,
+                    _DIV_MARGIN * scale * div_mult,
+                    self._fonts_for(scale, font_scale),
+                )
+                if best is not None and len(shown) <= best["_shown"]:
+                    continue
+                plan = attempt(compact, div_mult, gap_mult, rows_wanted,
+                               font_scale, index)
+                # 用丢掉之后的字段重新排一次：上面 attempt 排的是全量
+                fonts = plan["fonts"]
+                rows = self._pack(dc, shown, budget, plan["gap_label"],
+                                  plan["gap_unit"], plan["div_margin"], fonts)
+                plan["rows"] = rows
+                plan["placed"] = sum(len(r) for r in rows)
+                plan["_shown"] = len(shown)
+                best = plan
+
+        if best is None:
+            # 理论上到不了这儿（字段至少 1 个，总能排下）；真到了就退回最保守的形态
+            sections = sections_for(False) or [("current", "当前", "0", "W")]
+            fonts = self._fonts_for(scale, base_font)
+            plan = attempt(False, 1.0, 1.0, 1, base_font, 0)
+            plan["rows"] = self._pack(dc, sections[:1], budget,
+                                      _GAP_LABEL * scale, _GAP_UNIT * scale,
+                                      _DIV_MARGIN * scale, fonts)
+            plan["placed"] = 1
+        best.pop("_shown", None)
+        return best
 
     def _highlight(self, total: int, height: int, origin_x: int, origin_y: int,
                    color: int) -> None:
@@ -699,27 +1067,6 @@ class TaskbarStrip:
                 view[idx] = int(hb * t + view[idx] * inv)
                 view[idx + 1] = int(hg * t + view[idx + 1] * inv)
                 view[idx + 2] = int(hr * t + view[idx + 2] * inv)
-
-    def _sections_width(self, dc, sections, pad_x, gap_label, gap_unit, div_margin,
-                        label_font, value_font, unit_font) -> int:
-        """量出这一组字段排下来要多宽。和 ``_layout`` 里的绘制用同一套间距常量。
-
-        dc 必须由调用方传进来：量位置（临时 DC）和真画（内存 DC）用的是两个
-        不同的设备上下文，之前想从 self 上取一个「当前 DC」，但在量位置那一步
-        还没建缓冲区，取到 None 会直接崩。
-        """
-        total = pad_x * 2
-        # sections 的元素是 (key, 标签, 数值, 单位) 四元组 —— key 只有菜单 /
-        # 配置那边用得到，量宽和绘制都只看后三个。
-        for i, (_key, label, value, unit) in enumerate(sections):
-            total += self._text_width(dc, label, label_font)
-            total += gap_label
-            total += self._text_width(dc, value, value_font)
-            if unit:
-                total += gap_unit + self._text_width(dc, unit, unit_font)
-            if i < len(sections) - 1:
-                total += div_margin * 2 + 1
-        return int(round(total))
 
     def _sample_taskbar(self, x: int, y: int, w: int, h: int):
         """采任务栏底色。取长条左外侧一点，避开长条自身和图标。
@@ -930,7 +1277,10 @@ class TaskbarStrip:
             return
 
         compose_shape_alpha(
-            self._view, w, h, margin=0, radius=min(_RADIUS, h / 2.0),
+            self._view, w, h, margin=0,
+            # 圆角必须和 _layout 里画描边用的那个一致，否则描边和 alpha 边缘对不齐，
+            # 半透明质感下会看到一圈毛边。多行时 _layout 会把它收小。
+            radius=self._radius or min(_RADIUS, h / 2.0),
             shape_w=w, shape_h=h, shadow=0,
             # 半透明质感整块压 alpha；线框质感用哨兵色抠出透明底。
             shape_alpha=pal["alpha"], key_rgb=pal["key"],

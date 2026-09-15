@@ -61,5 +61,23 @@ for lineno, line in enumerate(NSI.read_text(encoding="utf-8-sig").splitlines(), 
         problems += 1
         print(f"PowerMonitor.nsi:{lineno}: 安装脚本在删用户数据目录 -> {line.strip()}")
 
+# ---- CreateWindowExW 的第一个参数必须是扩展样式 ----
+# 踩过一次：把 `WS_CLIPCHILDREN` 当成 exStyle 传了进去。窗口样式和扩展样式里
+# 有一批**同值不同义**的位，其中 WS_CLIPCHILDREN(0x02000000) 在扩展样式里正好是
+# WS_EX_COMPOSITED —— 于是整个窗口走了「自下而上 + 子控件双缓冲」的特殊绘制通路，
+# ListView 的表体一个字都不画，而 LVM_GETITEMCOUNT / LVM_GETITEMTEXTW 读回来
+# 完全正常（数据全对、就是白板），只有肉眼看得出来。这里直接禁掉这个写法。
+_BAD_EXSTYLE = re.compile(r"CreateWindowExW\(\s*WS_")
+for path in sorted(ROOT.glob("*.py")):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        # 注释里会引用这个错误写法当反面教材，跳过（这条规则我自己的注释就中过一次）
+        if stripped.startswith("#"):
+            continue
+        if _BAD_EXSTYLE.search(line):
+            problems += 1
+            print(f"{path.name}:{lineno}: CreateWindowExW 第一个参数疑似窗口样式 "
+                  f"（窗口样式位在扩展样式里是别的含义）-> {stripped}")
+
 print("OK" if not problems else f"发现 {problems} 处可疑")
 sys.exit(1 if problems else 0)

@@ -22,7 +22,7 @@ os.environ.setdefault("POWERMON_DEBUG", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from powermon import debug, taskbar, w32  # noqa: E402
+from powermon import debug, stripopts, taskbar, w32  # noqa: E402
 from powermon.app import enable_dpi_awareness  # noqa: E402
 from powermon.config import Config  # noqa: E402
 from powermon.meter import Snapshot, rate_at  # noqa: E402
@@ -101,11 +101,17 @@ def main() -> int:
     crop_w = int(argv[0]) if argv else 1300
     x0 = int(argv[1]) if len(argv) > 1 else 0
     name = argv[2] if len(argv) > 2 else "strip_live.png"
+    # 第 4 个参数：要显示哪些字段。all = 全部勾上（用来验折行）。
+    fields = argv[3] if len(argv) > 3 else ""
 
     cfg = Config()
     cfg.strip_enabled = True
+    if fields == "all":
+        cfg.strip_fields = list(stripopts.FIELD_KEYS)
+    elif fields:
+        cfg.strip_fields = [f for f in fields.split(",") if f]
     print(taskbar.describe())
-    print(f"strip_position={cfg.strip_position}")
+    print(f"strip_position={cfg.strip_position} 字段={cfg.strip_fields}")
 
     snap = make_snapshot(cfg, time.time())
     strip = TaskbarStrip(cfg)
@@ -120,11 +126,19 @@ def main() -> int:
 
     info = taskbar.taskbar()
     top = info[1][1] - 8
+    # 抓之前再把自己抬到兄弟窗口最顶层并重画一次：
+    # 本机通常还跑着一个正式版的 PowerMonitor，它也有长条、也在定期抢 HWND_TOP。
+    # 不重申一次的话抓到的可能是**它**（两张长条锚点相同、互相盖住），
+    # 于是「我的长条画错了」这种假警报就来了。
+    strip._ensure_above_siblings(force=True)
+    strip._render_if_needed(snap)
+    time.sleep(0.2)
     grab(x0, top, crop_w, info[1][3] - info[1][1] + 12, name)
 
     if strip.hwnd:
         r = wintypes_rect(strip.hwnd)
-        print(f"长条实际窗口矩形 = {r}")
+        print(f"长条实际窗口矩形 = {r}  排了 {strip._plan_rows} 行 "
+              f"（计划高 {strip._plan_height}px，圆角 {strip._radius:.1f}）")
     strip.destroy()
     print("已销毁")
     return 0

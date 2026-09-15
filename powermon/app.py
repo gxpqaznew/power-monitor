@@ -27,6 +27,7 @@ from .iconmake import make_icon, tray_label
 from .meter import EnergyMeter, Snapshot
 from .panel import Panel, fmt_duration
 from .strip import TaskbarStrip
+from .stats import StatsWindow
 from .tray import (
     CMD_ABOUT,
     CMD_FEE_SETTINGS,
@@ -41,6 +42,7 @@ from .tray import (
     CMD_QUIT,
     CMD_RESET,
     CMD_SIZE_BASE,
+    CMD_STATS,
     CMD_THEME_BASE,
     CMD_TOGGLE_AUTOSTART,
     CMD_TOGGLE_PANEL,
@@ -186,6 +188,9 @@ class PowerMonitorApp:
         self.panel = Panel(self.cfg)
         self.strip = TaskbarStrip(self.cfg)
         self.fee = FeeSettingsDialog(self.cfg, self._after_fee_saved)
+        # 用量统计窗口：按天 / 按月 / 按年 / 按每次开机 / 按时段五个维度。
+        # 跟电价窗口一样是「平时不建、点了才建」的独立窗口。
+        self.stats = StatsWindow(self.meter, self.cfg)
         self.tray = TrayIcon(
             self._build_menu, self._on_command, self._on_extra_message
         )
@@ -312,6 +317,8 @@ class PowerMonitorApp:
         menu.attach("长条大小", self._menu_size())
         menu.attach("长条显示内容", self._menu_field())
         menu.separator()
+        # 统计放在电价设置上面：用户是「看用量」来的，翻账本比改电价常用得多
+        menu.item(CMD_STATS, "用量统计…")
         menu.item(CMD_FEE_SETTINGS, "电价设置…")
         menu.item(CMD_OPEN_CONFIG, "打开配置文件")
         menu.separator()
@@ -349,6 +356,8 @@ class PowerMonitorApp:
                 else:
                     self._toggle_strip()
                 return self.ROOT_MENU
+            elif cmd == CMD_STATS:
+                self._open_stats()
             elif cmd == CMD_FEE_SETTINGS:
                 self._open_fee_settings()
             elif cmd == CMD_OPEN_CONFIG:
@@ -528,6 +537,12 @@ class PowerMonitorApp:
     def _open_fee_settings(self) -> None:
         """打开电价设置窗口（省份预设 + 手工修改）。"""
         self.fee.show()
+
+    def _open_stats(self) -> None:
+        """打开用量统计窗口（按天 / 按月 / 按年 / 按每次开机 / 按时段）。"""
+        # 电价或币种可能刚在电价窗口改过，窗口里要显示的是当前值
+        self.stats.cfg = self.cfg
+        self.stats.show()
 
     def _after_fee_saved(self) -> None:
         """电价一改，图标 / 提示 / 面板上的电费立刻跟着变。"""
@@ -787,6 +802,7 @@ class PowerMonitorApp:
             self.meter.stop()
         finally:
             self.fee.destroy()
+            self.stats.destroy()
             self.tray.destroy()
             self.panel.destroy()
             self.strip.destroy()
@@ -796,6 +812,7 @@ class PowerMonitorApp:
             user32.KillTimer(None, self._timer_id)
             self._timer_id = 0
         self.fee.destroy()
+        self.stats.destroy()
         self.tray.destroy()
         self.strip.destroy()
         user32.PostQuitMessage(0)
@@ -938,6 +955,13 @@ def self_test() -> int:
         probe_h = 47
         width = strip._layout(strip_dc, 1.25, _ProbeSnap(), render=False)[0]
         check("长条宽度算得出来", width > 100, f"{width}px")
+        # 画布高度必须等于窗口胶囊高度。折行改造时这里一度写成「行高 × 行数」
+        # （单行只有 32.5px，而窗口高 47px），于是底色和描边只画了上面一截，
+        # 下面那条从没被填过 —— 叠上半透明就是一条黑带。
+        _w0, canvas_h, _p0 = strip._layout(strip_dc, 1.25, _ProbeSnap(),
+                                           render=False, height=probe_h)
+        check("单行时画布占满胶囊高度（不会画出矮一截的胶囊）",
+              canvas_h == probe_h, f"{canvas_h} == {probe_h}")
         bmp, view = dib_section(strip_dc, width, probe_h)
         if bmp:
             old_bmp = gdi32.SelectObject(strip_dc, bmp)
@@ -973,7 +997,9 @@ def self_test() -> int:
 
     check("长条质感有 6 档", len(stripopts.THEMES) == 6,
           "、".join(stripopts.THEME_KEYS))
-    check("长条字号有 5 档", len(stripopts.FONT_SCALES) == 5)
+    # 6 档 = 常规 5 档 + 折行兜底的「极小」。多这一档是为了让「勾满 15 项」也
+    # 排得进去（0.85 那档的纯文本宽度就已经顶到两行的总宽了）。
+    check("长条字号有 6 档（含折行兜底的极小）", len(stripopts.FONT_SCALES) == 6)
     check("长条大小有 3 档", len(stripopts.SIZES) == 3)
     # 关键回归：默认档必须和改造前**一模一样**，否则老用户升个级长条就变高度了
     check("默认档高度比例仍是 0.78",
@@ -986,7 +1012,7 @@ def self_test() -> int:
           " < ".join(f"{r:.3f}" for r in size_ratios))
     font_ratios = [stripopts.height_ratio(_variant(strip_font_scale=v))
                    for v, _label in stripopts.FONT_SCALES]
-    check("长条字号五档高度递增",
+    check("长条字号各档高度递增",
           all(a < b for a, b in zip(font_ratios, font_ratios[1:])),
           " < ".join(f"{r:.3f}" for r in font_ratios))
 
@@ -1093,6 +1119,25 @@ def self_test() -> int:
               bool(big_row) and all(a == big_pal["alpha"] for a in big_row),
               f"alpha={sorted(set(big_row)) if big_row else '无数据'}")
         big.destroy()
+
+        # ---- 「勾了多少就显示多少」----
+        # 曾经的故障：宽度上限被一个 560 的常量卡成了真上限，勾 8 项也只显示 4 项
+        # （「从后往前丢字段」那段看起来完全正常，只有量一下排了几段才看得出来）。
+        # 这条链路是「放开上限 → 折行 → 短标签 → 收紧间距 → 更小字号」，任何一环
+        # 断掉都会退回去，所以不逐环测，只测最终结果：全勾上之后一个都不许丢。
+        full_strip = TaskbarStrip(_variant(strip_fields=list(stripopts.FIELD_KEYS)))
+        try:
+            sections = full_strip._sections(_ProbeSnap())
+            plan = full_strip._plan(theme_dc, _ProbeSnap(), 1.25, 883,
+                                    int(round(60 * 0.94)))
+            check(f"可用 883px：{len(sections)} 项全勾一个不丢",
+                  plan["placed"] == plan["total"] == len(sections),
+                  f"排上 {plan['placed']}/{plan['total']}，{len(plan['rows'])} 行，"
+                  f"密度档 {plan['density']}，字号 {plan['font_scale']}")
+            check("字段多的时候确实折了行", len(plan["rows"]) >= 2,
+                  f"{len(plan['rows'])} 行")
+        finally:
+            full_strip.destroy()
     finally:
         gdi32.DeleteDC(theme_dc)
         user32.ReleaseDC(None, screen_dc)
@@ -1132,6 +1177,85 @@ def self_test() -> int:
         if dialog is not None:
             try:
                 dialog.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ---- 用量统计窗口（Tab + ListView 明细表）----
+    # 这一段专门抓「单元测试抓不到」的那类故障，它们全都在这一块真实发生过：
+    #   * 窗口过程没套 @WNDPROC → 建窗口直接抛 TypeError；
+    #   * 给 SendMessageW 传结构指针时忘了取地址 → ArgumentError，或者传成野指针
+    #     后控件显示垃圾字符（项数、选中下标却是对的）；
+    #   * 把 WS_CLIPCHILDREN 当成 exStyle 传 → 那个位在扩展样式里正好是
+    #     WS_EX_COMPOSITED，于是 ListView 的**表体一个字都不画**，而
+    #     LVM_GETITEMCOUNT / LVM_GETITEMTEXTW 读回来一切正常。
+    # 所以这里必须真的建窗口、真的把格子文字读回来。
+    from . import stats as stats_mod
+
+    class _StubMeter:
+        """自检不能真起传感器线程，给统计窗口喂一份固定账本。"""
+
+        def stats_totals(self):
+            return {"today": (1200.0, 0.67), "month": (24000.0, 13.4),
+                    "year": (156700.0, 81.9), "total": (156700.0, 81.9),
+                    "month_days": 18, "year_days": 120, "days": 120,
+                    "sessions": 41}
+
+        def stats_rows(self, kind, limit=500):
+            return [{"when": f"2026-01-{i:02d}", "wh": 100.0 * i,
+                     "cost": 0.06 * i, "seconds": 3600.0 * i,
+                     "note": "自检", "day": "2026-01-01"}
+                    for i in range(1, min(6, limit + 1))]
+
+    stats_win = None
+    try:
+        stats_win = StatsWindow(_StubMeter(), cfg)
+        built = stats_win.create()
+        check("用量统计窗口能建出来", built,
+              "" if built else f"err={ctypes.get_last_error()}")
+        if built:
+            listview = stats_win._controls.get(stats_mod.IDC_LIST)
+            tabctl = stats_win._controls.get(stats_mod.IDC_TAB)
+            check("统计窗口的 Tab 与 ListView 都建出来了",
+                  bool(listview) and bool(tabctl))
+            stats_win.show()
+            # 自己抽消息，不进消息循环（自检不能卡住）
+            probe_msg = wintypes.MSG()
+            for _ in range(40):
+                while user32.PeekMessageW(ctypes.byref(probe_msg), None, 0, 0, 1):
+                    user32.TranslateMessage(ctypes.byref(probe_msg))
+                    user32.DispatchMessageW(ctypes.byref(probe_msg))
+            count = int(user32.SendMessageW(listview, stats_mod.LVM_GETITEMCOUNT,
+                                            0, 0))
+            check("统计表格真的填进去了", count == 5, f"{count} 行")
+            cell = ctypes.create_unicode_buffer(256)
+            row_item = stats_mod.LVITEMW()
+            row_item.mask = stats_mod.LVIF_TEXT
+            row_item.iItem = 0
+            row_item.iSubItem = 0
+            row_item.pszText = ctypes.cast(cell, ctypes.c_wchar_p)
+            row_item.cchTextMax = 256
+            user32.SendMessageW(listview, stats_mod.LVM_GETITEMTEXTW, 0,
+                                ctypes.addressof(row_item))
+            check("表格第一格能原样读回（不是乱码）",
+                  cell.value == "2026-01-01", repr(cell.value))
+            labels = []
+            for i in range(len(stats_mod.TABS)):
+                tbuf = ctypes.create_unicode_buffer(64)
+                titem = stats_mod.TCITEMW()
+                titem.mask = stats_mod.TCIF_TEXT
+                titem.pszText = ctypes.cast(tbuf, ctypes.c_wchar_p)
+                titem.cchTextMax = 64
+                user32.SendMessageW(tabctl, stats_mod.TCM_GETITEMW, i,
+                                    ctypes.addressof(titem))
+                labels.append(tbuf.value)
+            check("五个分页标题都能原样读回（按天/按月/按年/按每次开机/按时段）",
+                  labels == [label for _k, label in stats_mod.TABS], str(labels))
+    except Exception as exc:  # noqa: BLE001 - 自检就是要抓住任何异常
+        check("用量统计流程无异常", False, repr(exc))
+    finally:
+        if stats_win is not None:
+            try:
+                stats_win.destroy()
             except Exception:  # noqa: BLE001
                 pass
 

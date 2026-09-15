@@ -44,6 +44,11 @@ CURVE_POINTS = int(2 * 3600 / CURVE_BUCKET)
 PERSIST_INTERVAL = 15.0
 # 每日账本最多保留多少天（约 13 个月）。再老的只留在 total_wh 里。
 HISTORY_DAYS = 400
+# 「每次开机」的明细最多保留多少条。一条几十字节，240 条也就十几 KB，
+# 够翻大半年的开机关机记录。
+HISTORY_SESSIONS = 240
+# 时段分布的桶数（0~23 点）
+HOUR_BUCKETS = 24
 
 
 def _num_seq(source, index: int, default: float = 0.0) -> float:
@@ -77,6 +82,27 @@ def _num(source, key: str, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# 周几（``time.struct_time.tm_wday`` 是 0=周一）
+WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
+def _duration(seconds: float) -> str:
+    """紧凑时长：45m / 2h13m / 3d4h。
+
+    统计表里一列放得下，比「2 小时 13 分」省地方，也不会在窄窗口里折行。
+    这里刻意不 import panel.fmt_duration —— panel 反过来要 import meter，
+    会绕成循环。
+    """
+    minutes = int(max(0.0, seconds) // 60)
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{mins:02d}m"
+    return f"{mins}m"
 
 
 def segment_of(cfg: Config, when: time.struct_time | None = None) -> str:
@@ -228,6 +254,16 @@ class EnergyMeter:
         # total 是不够的，用户要看的是「哪天用了多少」。
         self._days: dict[str, dict[str, float]] = {}
 
+        # 每次开机的明细：{开机时刻(int): {"wh","cost","seconds","last"}}
+        # 「每次开机」不等于「当前这次」—— 用户要的是能把历史每一次翻出来看，
+        # 所以按开机时刻（Kernel-Boot 事件）分条存，同一次开机内重开程序接上同一条。
+        self._sessions: dict[int, dict[str, float]] = {}
+        self._boot_key: int = 0
+
+        # 时段分布：[0 点, 1 点, … 23 点] 各自累计了多少 Wh。
+        # 用来回答「这台机器一天里什么时候最费电」，比总量有意思得多。
+        self._hours: list[float] = [0.0] * HOUR_BUCKETS
+
         # 全局
         self._total_wh: float = 0.0
         self._total_cost: float = 0.0
@@ -300,6 +336,8 @@ class EnergyMeter:
             self._total_sessions += 1
 
         self._restore_days(state)
+        self._restore_sessions(state)
+        self._restore_hours(state)
 
         # 旧版没有 total_cost（只存了 session/today 的电费）。如果 days 里已经
         # 有历史电费，就把它补齐 —— 否则「累计电量」几千瓦时、「累计电费」却是
@@ -368,6 +406,98 @@ class EnergyMeter:
         keep = sorted(self._days)[-HISTORY_DAYS:]
         self._days = {k: self._days[k] for k in keep}
 
+    # ------------------------------------------------------ 每次开机 / 时段
+
+    def _restore_sessions(self, state: dict) -> None:
+        """恢复「每次开机用了多少」的明细。
+
+        键用**开机时刻**（System 日志里的 Kernel-Boot 事件时间）：
+
+        * 同一次开机内反复开关程序 → 落在同一条上接着累加，不会碎成一堆小条目；
+        * 真正重启之后开机时刻变了 → 自然分出一条新记录。
+
+        这正是用户说的「每次开机后分别用了多少（每次，不是当前次）」。
+        """
+        raw = state.get("sessions")
+        pairs: list[tuple[object, object]] = []
+        if isinstance(raw, dict):
+            pairs = list(raw.items())
+        elif isinstance(raw, list):
+            pairs = list(enumerate(raw))
+        for key, item in pairs:
+            try:
+                boot = int(float(key))
+            except (TypeError, ValueError):
+                continue
+            if boot <= 0:
+                continue
+            if isinstance(item, dict):
+                wh, cost = _num(item, "wh"), _num(item, "cost")
+                seconds, last = _num(item, "seconds"), _num(item, "last")
+            elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                wh, cost = _num_seq(item, 0), _num_seq(item, 1)
+                seconds, last = _num_seq(item, 2), _num_seq(item, 3)
+            else:
+                continue
+            self._sessions[boot] = {
+                "wh": max(0.0, wh),
+                "cost": max(0.0, cost),
+                "seconds": max(0.0, seconds),
+                "last": last or float(boot),
+            }
+
+        # 本次开机：有就接上，没有就新建 —— 保证「当前这一次」也在明细里看得见
+        boot_key = int(self._power_on_ts or self._first_seen_ts or time.time())
+        self._boot_key = boot_key
+        entry = self._sessions.get(boot_key)
+        if entry is None:
+            self._sessions[boot_key] = {
+                "wh": 0.0,
+                "cost": 0.0,
+                "seconds": 0.0,
+                "last": max(self._first_seen_ts, boot_key),
+            }
+        else:
+            entry["last"] = max(entry["last"], self._first_seen_ts)
+        self._prune_sessions()
+
+    def _prune_sessions(self) -> None:
+        """只留最近 HISTORY_SESSIONS 次开机（按开机时刻排序）。"""
+        if len(self._sessions) <= HISTORY_SESSIONS:
+            return
+        keep = sorted(self._sessions)[-HISTORY_SESSIONS:]
+        self._sessions = {k: self._sessions[k] for k in keep}
+
+    def _bump_session(self, ts: float, wh: float, cost: float,
+                      seconds: float) -> None:
+        """把这一笔记到**本次开机**头上。调用方必须已持有 ``self._lock``。"""
+        item = self._sessions.get(self._boot_key)
+        if item is None:
+            item = {"wh": 0.0, "cost": 0.0, "seconds": 0.0, "last": ts}
+            self._sessions[self._boot_key] = item
+        item["wh"] += wh
+        item["cost"] += cost
+        item["seconds"] += seconds
+        item["last"] = ts
+
+    def _restore_hours(self, state: dict) -> None:
+        """恢复时段分布（0~23 点各累计多少 Wh）。长度对不上一律重置。"""
+        raw = state.get("hours")
+        values: list[float] = []
+        if isinstance(raw, list):
+            values = [_num_seq(raw, i) for i in range(len(raw))]
+        elif isinstance(raw, dict):
+            values = [_num(raw, str(i)) for i in range(HOUR_BUCKETS)]
+        if len(values) != HOUR_BUCKETS:
+            self._hours = [0.0] * HOUR_BUCKETS
+            return
+        self._hours = [max(0.0, v) for v in values]
+
+    def _bump_hour(self, hour: int, wh: float) -> None:
+        """记到「几点钟」这个桶上。调用方必须已持有 ``self._lock``。"""
+        if 0 <= hour < HOUR_BUCKETS:
+            self._hours[hour] += wh
+
     def _bump_day(self, day: str, wh: float, cost: float, seconds: float) -> None:
         """把这一笔记到「那一天」头上。调用方必须已经持有 ``self._lock``。"""
         item = self._days.get(day)
@@ -421,6 +551,19 @@ class EnergyMeter:
                     ]
                     for day, item in sorted(self._days.items())[-HISTORY_DAYS:]
                 },
+                # 每次开机一条：[电量Wh, 电费, 统计秒数, 最后采样时刻]。
+                # 键是开机时刻，所以「同一次开机内重开程序」不会碎成多条。
+                "sessions": {
+                    str(boot): [
+                        round(item["wh"], 3),
+                        round(item["cost"], 5),
+                        round(item["seconds"], 1),
+                        round(item["last"], 1),
+                    ]
+                    for boot, item in sorted(self._sessions.items())[-HISTORY_SESSIONS:]
+                },
+                # 0~23 点各累计多少 Wh（跨所有天累加，用来找「几点最费电」）
+                "hours": [round(v, 3) for v in self._hours],
                 "total_wh": round(self._total_wh, 4),
                 "total_cost": round(self._total_cost, 5),
                 "total_sessions": self._total_sessions,
@@ -520,6 +663,10 @@ class EnergyMeter:
                     self._today_cost += money
                     self._covered_seconds += dt
                     self._bump_day(today, energy_wh, money, dt)
+                    # 同一条数据同时记到「本次开机」和「几点钟」两个维度上 ——
+                    # 统计窗口的三个视图（每天 / 每次开机 / 按时段）都从这儿来。
+                    self._bump_session(reading.ts, energy_wh, money, dt)
+                    self._bump_hour(tm.tm_hour, energy_wh)
 
                     if valley:
                         self._valley_wh += energy_wh
@@ -596,6 +743,132 @@ class EnergyMeter:
                 gpu_names=self._hub.gpu.names,
                 gpu_limits=self._hub.gpu.limits,
             )
+
+    # ------------------------------------------------------------- 统计明细
+
+    def stats_totals(self) -> dict:
+        """统计窗口顶部那行汇总：今日 / 本月 / 今年 / 累计。
+
+        本月与今年都从每日账本现算（而不是各存一份），只有一个真源 —— 存三份
+        迟早会互相对不上。
+        """
+        with self._lock:
+            today = time.strftime("%Y-%m-%d")
+            month, year = today[:7], today[:4]
+
+            def fold(prefix: str) -> tuple[float, float, int]:
+                wh = cost = 0.0
+                days = 0
+                for day, item in self._days.items():
+                    if day.startswith(prefix):
+                        wh += item["wh"]
+                        cost += item["cost"]
+                        days += 1
+                return wh, cost, days
+
+            month_wh, month_cost, month_days = fold(month)
+            year_wh, year_cost, year_days = fold(year)
+            return {
+                "today": (self._today_wh, self._today_cost),
+                "month": (month_wh, month_cost),
+                "year": (year_wh, year_cost),
+                "total": (self._total_wh, self._total_cost),
+                "month_days": month_days,
+                "year_days": year_days,
+                "days": len(self._days),
+                "sessions": len(self._sessions),
+            }
+
+    def stats_rows(self, kind: str, limit: int = 500) -> list[dict]:
+        """按某个维度取明细行，**新的在前**。
+
+        kind 取值：``day`` / ``month`` / ``year`` / ``session`` / ``hour``。
+        每行统一是 ``{"when", "wh", "cost", "seconds", "note"}`` —— 统计窗口只
+        认这一种形状，加维度时不用改窗口代码。
+        """
+        with self._lock:
+            if kind == "session":
+                rows = []
+                for boot, item in sorted(self._sessions.items(), reverse=True):
+                    tm = time.localtime(boot)
+                    span = max(0.0, item["last"] - boot)
+                    rows.append({
+                        "when": time.strftime("%m-%d %H:%M", tm),
+                        "wh": item["wh"],
+                        "cost": item["cost"],
+                        "seconds": item["seconds"],
+                        # 「这次开机一共开了多久」和「统计到多久」是两回事：
+                        # 程序没跑的那段测不到，但用户想知道整次开机有多长。
+                        "note": "开机 " + _duration(span),
+                        "day": time.strftime("%Y-%m-%d", tm),
+                    })
+                return rows[:limit]
+
+            if kind == "hour":
+                total = sum(self._hours) or 0.0
+                rows = []
+                for h in range(HOUR_BUCKETS):
+                    wh = self._hours[h]
+                    share = (wh / total * 100.0) if total > 0 else 0.0
+                    rows.append({
+                        "when": f"{h:02d}:00 – {h + 1:02d}:00",
+                        "wh": wh,
+                        "cost": wh / 1000.0 * self._cfg.price_flat,
+                        "seconds": 0.0,
+                        "note": f"占 {share:.1f}%" if wh > 0 else "—",
+                    })
+                return rows[:limit]
+
+            if kind == "day":
+                launched = self._sessions_per_day()
+                rows = []
+                for day, item in sorted(self._days.items(), reverse=True):
+                    tm = time.strptime(day, "%Y-%m-%d")
+                    rows.append({
+                        "when": f"{day} {WEEKDAYS[tm.tm_wday]}",
+                        "wh": item["wh"],
+                        "cost": item["cost"],
+                        "seconds": item["seconds"],
+                        "note": f"开机 {launched.get(day, 0)} 次"
+                                if launched.get(day) else "—",
+                        "day": day,
+                    })
+                return rows[:limit]
+
+            if kind in ("month", "year"):
+                width = 7 if kind == "month" else 4
+                groups: dict[str, dict[str, float]] = {}
+                for day, item in self._days.items():
+                    key = day[:width]
+                    acc = groups.setdefault(key, {"wh": 0.0, "cost": 0.0,
+                                                  "seconds": 0.0, "days": 0.0})
+                    acc["wh"] += item["wh"]
+                    acc["cost"] += item["cost"]
+                    acc["seconds"] += item["seconds"]
+                    acc["days"] += 1
+                rows = []
+                for key, acc in sorted(groups.items(), reverse=True):
+                    days = int(acc["days"])
+                    avg = acc["wh"] / days if days else 0.0
+                    rows.append({
+                        "when": key,
+                        "wh": acc["wh"],
+                        "cost": acc["cost"],
+                        "seconds": acc["seconds"],
+                        "note": f"{days} 天 · 日均 {avg / 1000:.2f} kWh",
+                        "day": key,
+                    })
+                return rows[:limit]
+
+            return []
+
+    def _sessions_per_day(self) -> dict[str, int]:
+        """每天开机几次（按开机时刻所在日期归组）。调用方必须已持有锁。"""
+        out: dict[str, int] = {}
+        for boot in self._sessions:
+            day = time.strftime("%Y-%m-%d", time.localtime(boot))
+            out[day] = out.get(day, 0) + 1
+        return out
 
     def curve(self) -> list[tuple[float, float]]:
         with self._lock:

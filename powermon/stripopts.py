@@ -31,7 +31,12 @@ THEME_LABEL = {k: t for k, t, _ in THEMES}
 THEME_HINT = {k: h for k, _, h in THEMES}
 
 # ------------------------------------------------------------------ 字号
+# 「极小」这一档不是让人手工点的常规档位，而是**折行时的最后一根救命稻草**：
+# 字段多到两行都塞不下时，只有把字再缩小 15% 才排得进去（文本宽度按比例缩，
+# 分隔和间隙不缩）。0.85 档下 15 个字段的纯文本就有 1495px，而本机两行合起来
+# 只有 1690px —— 除尽分隔线后正好贴边，实际排不下。所以必须留这一档。
 FONT_SCALES = [
+    (0.72, "极小"),
     (0.85, "小"),
     (1.00, "标准"),
     (1.15, "大"),
@@ -74,6 +79,29 @@ FIELDS = [
 ]
 FIELD_KEYS = tuple(k for k, _ in FIELDS)
 FIELD_LABEL = dict(FIELDS)
+
+# 紧凑标签：字段多到排不下时用（长条的可用宽度是任务栏上「开始按钮左边」那一段，
+# 本机只有 883px）。标签在每段里占的比例不小（「本次电费」四个字 ≈ 52px，
+# 一段总共才 126px），换成两个字就能多塞进四成字段。
+# 「本次电费」和「本次电量」都缩成「本次」会撞名 —— 无所谓，单位不同
+# （¥ / Wh / kWh），一格里有单位在，不会看错。
+SHORT_LABEL = {
+    "current": "当前",
+    "cpu": "CPU",
+    "gpu": "显卡",
+    "base": "其他",
+    "cost": "本次",
+    "session": "本次",
+    "today": "今日",
+    "today_cost": "今日",
+    "avg": "平均",
+    "peak": "峰值",
+    "uptime": "开机",
+    "segment": "时段",
+    "month": "本月",
+    "total": "累计",
+    "total_cost": "累计",
+}
 
 
 # ------------------------------------------------------------------ 取值
@@ -183,8 +211,12 @@ def field_value(key: str, snap, cfg) -> tuple[str, str, str] | None:
     return None
 
 
-def sections(snap, cfg) -> list[tuple[str, str, str, str]]:
-    """(key, 标签, 数值, 单位) 列表，按用户选的顺序。"""
+def sections(snap, cfg, compact: bool = False) -> list[tuple[str, str, str, str]]:
+    """(key, 标签, 数值, 单位) 列表，按用户选的顺序。
+
+    ``compact=True`` 时标签换成两字短名（见 ``SHORT_LABEL``）—— 字段多到一行
+    排不下、折行又不够高时，靠这个把字段全塞进去，而不是从后往前丢。
+    """
     out: list[tuple[str, str, str, str]] = []
     for key in enabled_fields(cfg):
         try:
@@ -197,6 +229,8 @@ def sections(snap, cfg) -> list[tuple[str, str, str, str]]:
         label, value, unit = got
         if value == "" and not unit:
             continue
+        if compact:
+            label = SHORT_LABEL.get(key, label)
         out.append((key, label, value, unit))
     return out
 

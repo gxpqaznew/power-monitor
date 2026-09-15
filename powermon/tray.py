@@ -54,6 +54,14 @@ CMD_OPEN_CONFIG = 31
 CMD_ABOUT = 32
 CMD_QUIT = 40
 
+# 长条外观 / 内容（托盘菜单的二级子菜单，见 app._build_menu）。
+# 每档占一个「区间」，命令号 = 基址 + 该档在 stripopts 目录里的下标；
+# 区间留得比现有档位数宽，以后加档位不用动老命令号。
+CMD_THEME_BASE = 50      # 50..59  长条质感（strippts.THEMES 下标）
+CMD_FONT_BASE = 60       # 60..69  长条字号（strippts.FONT_SCALES 下标）
+CMD_SIZE_BASE = 70       # 70..79  长条大小（strippts.SIZES 下标）
+CMD_FIELD_BASE = 80      # 80..99  长条显示内容（strippts.FIELDS 下标，勾选式）
+
 _CLASS_NAME = "PowerMonitorTrayWnd"
 _windows: dict[int, "TrayIcon"] = {}
 _wndproc_ref: WNDPROC | None = None  # 必须持引用，否则回调被 GC 掉会崩
@@ -278,8 +286,11 @@ class MenuBuilder:
         user32.AppendMenuW(self.handle, MF_STRING | MF_GRAYED, 0, text_)
         return self
 
-    def item(self, cmd: int, text: str, checked: bool = False) -> "MenuBuilder":
+    def item(self, cmd: int, text: str, checked: bool = False,
+             enabled: bool = True) -> "MenuBuilder":
         flags = MF_STRING | (MF_CHECKED if checked else 0)
+        if not enabled:
+            flags |= MF_GRAYED
         user32.AppendMenuW(self.handle, flags, cmd, text)
         return self
 

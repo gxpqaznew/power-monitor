@@ -68,7 +68,8 @@ def round_rect_sdf(px: float, py: float, w: float, h: float, radius: float) -> f
 def compose_shape_alpha(view, w: int, h: int, margin: int, radius: float,
                        shape_w: int, shape_h: int, shadow: int = 0,
                        shadow_rgb=(14, 18, 26), shadow_alpha: int = 96,
-                       shadow_dy: int = 0) -> None:
+                       shadow_dy: int = 0, shape_alpha: int = 255,
+                       key_rgb=None) -> None:
     """把 GDI 画好的内容补上 alpha，做成「圆角矩形 + 外圈柔影」。
 
     ``margin`` 是形状四周留出的空白（窗口比形状大这么多），形状位于
@@ -85,13 +86,65 @@ def compose_shape_alpha(view, w: int, h: int, margin: int, radius: float,
         预乘 alpha 下最终色 = RGB + 底层 ×(1-a)，RGB 不乘就会偏亮）
       * 形状外        → RGB 换成阴影色，alpha 按距离衰减（预乘）
 
+    ``shape_alpha``（0~255）用来做「整块半透明」的质感（玻璃 / 固定深浅卡片）：
+    形状内部不再写 255，而是写这个值，同时把内部 RGB 一并预乘 —— 预乘下
+    不把 RGB 乘下去，半透明胶囊会整体发白发亮，像蒙了层灰。
+
+    ``key_rgb`` 是「抠色」模式（只留描边和文字的线框主题靠它）：先拿这个颜色铺满
+    底，再在上面画描边和文字，最后把这个颜色的像素抠成全透明。**调用方必须把这个
+    颜色设成真实的背景色**，否则抗锯齿的字边会留下难看的彩色描边 —— 原因见
+    ``inside()`` 里的注释。指定 key_rgb 时 ``shape_alpha`` 不再生效。
+
     性能：只遍历靠边的一圈像素。圆角所在的上下各 ``radius+1`` 行整行处理
     （那几行的形状边界是弧线），中间各行只处理左右各几列，中间一整段内部直接
     补 alpha。整块逐像素跑要上百万次循环，那样每帧都得卡一下。
+    半透明 / 抠色模式必须逐像素处理内部（要动 RGB 或判颜色），长条只有
+    两万来像素，代价可以接受；默认档（不透明）仍然走快路径。
     """
     if view is None or margin < 0:
         return
     sr, sg, sb = shadow_rgb
+
+    sa = max(0, min(255, int(shape_alpha)))
+    key = None
+    if key_rgb is not None:
+        key = (int(key_rgb[0]), int(key_rgb[1]), int(key_rgb[2]))
+
+    if key is not None:
+        kr, kg, kb = key
+
+        def inside(idx: int) -> None:
+            # 抠色：底色（= 键色）像素全透明，其余原样保留为不透明。
+            #
+            # **调用方必须把「底色」设成背后的真实颜色**，不能用醒目的哨兵色。
+            # 文字是抗锯齿画的，字边那圈像素是「文字色 × 底色」的混合色：底色
+            # 一旦是哨兵色（比如品红），这些边缘像素就真带着品红，而且不等于
+            # 哨兵色、抠不掉，于是整字镶一圈紫边。底色取真实背景色时，边缘像素
+            # 恰好就是「文字画在背景上」应有的颜色，原样保留即正确 —— 不需要
+            # 按覆盖率反解（覆盖率无法从颜色可靠反推，反解会留下残留）。
+            if (abs(view[idx] - kb) <= 2 and abs(view[idx + 1] - kg) <= 2
+                    and abs(view[idx + 2] - kr) <= 2):
+                view[idx] = view[idx + 1] = view[idx + 2] = view[idx + 3] = 0
+            else:
+                view[idx + 3] = 255
+    elif sa < 255:
+        # 注意：这个名字不能叫 k —— 下面「边缘」和「阴影」两处也要用一个 0~1 的
+        # 系数，如果都叫 k 就会把这里的 k 覆盖掉，而 inside() 是闭包、取的是**调用
+        # 时**的 k。后果是：每行一旦处理过一个边缘像素，之后整行的内部像素就都
+        # 按那个边缘像素的系数去乘 RGB，画面上出现规则的横条纹。
+        # （这是老代码里就埋着的坑，之前长条一直是不透明的 255，走不到这条分支，
+        #  加了半透明质感才暴露出来。）
+        inside_k = sa / 255.0
+
+        def inside(idx: int) -> None:
+            view[idx] = int(view[idx] * inside_k)
+            view[idx + 1] = int(view[idx + 1] * inside_k)
+            view[idx + 2] = int(view[idx + 2] * inside_k)
+            view[idx + 3] = sa
+    else:
+        def inside(idx: int) -> None:
+            view[idx + 3] = 255
+
     # 上下：圆角弧线会横跨 radius 行，这几行必须整行算
     corner_rows = max(shadow, int(radius)) + 1
     # 左右：中间各行只有贴着边的两三列是边界
@@ -102,7 +155,7 @@ def compose_shape_alpha(view, w: int, h: int, margin: int, radius: float,
     for y in range(h):
         if full_shape and not (y < corner_rows or y >= h - corner_rows):
             for x in range(col_band, max(col_band, w - col_band)):
-                view[(y * w + x) * 4 + 3] = 255
+                inside((y * w + x) * 4)
             xs = list(range(0, min(w, col_band))) + \
                  list(range(max(0, w - col_band), w))
         else:
@@ -114,14 +167,23 @@ def compose_shape_alpha(view, w: int, h: int, margin: int, radius: float,
             d = round_rect_sdf(px - margin, py - margin, shape_w, shape_h, radius)
             idx = (y * w + x) * 4
             if d <= -0.5:
-                view[idx + 3] = 255
+                inside(idx)
             elif d < 0.5:
-                a = int(255 * (0.5 - d))
-                k = a / 255.0
-                view[idx] = int(view[idx] * k)
-                view[idx + 1] = int(view[idx + 1] * k)
-                view[idx + 2] = int(view[idx + 2] * k)
-                view[idx + 3] = a
+                if key is not None:
+                    # 抠色模式下边缘也走抠色：底色像素直接透明、描边像素保持不透明。
+                    # 若按 d 给边缘做半透明，底色哨兵色就会以「半透明品红」的形态
+                    # 留成胶囊外圈的一道毛边 —— 线框主题最扎眼的缺陷。
+                    inside(idx)
+                else:
+                    a = int(255 * (0.5 - d))
+                    # 半透明模式下边缘也要跟着压下去，否则会留一圈「发光」的硬边。
+                    if sa < 255:
+                        a = int(a * sa / 255.0)
+                    edge_k = a / 255.0
+                    view[idx] = int(view[idx] * edge_k)
+                    view[idx + 1] = int(view[idx + 1] * edge_k)
+                    view[idx + 2] = int(view[idx + 2] * edge_k)
+                    view[idx + 3] = a
             else:
                 if shadow <= 0:
                     view[idx] = view[idx + 1] = view[idx + 2] = view[idx + 3] = 0
@@ -138,10 +200,10 @@ def compose_shape_alpha(view, w: int, h: int, margin: int, radius: float,
                 if alpha <= 0:
                     view[idx] = view[idx + 1] = view[idx + 2] = view[idx + 3] = 0
                 else:
-                    k = alpha / 255.0
-                    view[idx] = int(sb * k)
-                    view[idx + 1] = int(sg * k)
-                    view[idx + 2] = int(sr * k)
+                    shadow_k = alpha / 255.0
+                    view[idx] = int(sb * shadow_k)
+                    view[idx + 1] = int(sg * shadow_k)
+                    view[idx + 2] = int(sr * shadow_k)
                     view[idx + 3] = alpha
 
 

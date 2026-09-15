@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from . import APP_NAME, __version__
-from . import debug, trayreg
+from . import debug, stripopts, trayreg
 from .config import CONFIG_PATH, Config, app_dir
 from .fee_dialog import FeeSettingsDialog
 from .iconmake import make_icon, tray_label
@@ -29,6 +29,8 @@ from .strip import TaskbarStrip
 from .tray import (
     CMD_ABOUT,
     CMD_FEE_SETTINGS,
+    CMD_FIELD_BASE,
+    CMD_FONT_BASE,
     CMD_MODE_AVERAGE,
     CMD_MODE_COST,
     CMD_MODE_CURRENT,
@@ -37,6 +39,8 @@ from .tray import (
     CMD_PIN_TASKBAR,
     CMD_QUIT,
     CMD_RESET,
+    CMD_SIZE_BASE,
+    CMD_THEME_BASE,
     CMD_TOGGLE_AUTOSTART,
     CMD_TOGGLE_PANEL,
     CMD_TOGGLE_STRIP,
@@ -227,6 +231,36 @@ class PowerMonitorApp:
         menu.item(CMD_TOGGLE_AUTOSTART, "开机自启动", autostart_enabled())
         menu.item(CMD_PIN_TASKBAR, "常驻任务栏（^ 左侧）", trayreg.is_pinned())
         menu.item(CMD_TOGGLE_STRIP, "任务栏长条读数", self.cfg.strip_enabled)
+
+        # 长条外观 / 内容：都做成根菜单下的**二级**子菜单（右键图标点两下就到），
+        # 不往三级里塞 —— 用户的原话是「角标点开后在二级菜单里调」，层级一深就没人找了。
+        theme_menu = MenuBuilder.submenu()
+        active_theme = stripopts.theme(self.cfg)
+        for i, (key, label, _hint) in enumerate(stripopts.THEMES):
+            theme_menu.item(CMD_THEME_BASE + i, label, key == active_theme)
+        menu.attach("长条质感", theme_menu)
+
+        font_menu = MenuBuilder.submenu()
+        active_scale = stripopts.font_scale(self.cfg)
+        for i, (value, label) in enumerate(stripopts.FONT_SCALES):
+            font_menu.item(CMD_FONT_BASE + i, label, abs(value - active_scale) < 1e-6)
+        menu.attach("长条字号", font_menu)
+
+        size_menu = MenuBuilder.submenu()
+        active_size = stripopts.size_key(self.cfg)
+        for i, (key, label, _ratio, _pad) in enumerate(stripopts.SIZES):
+            size_menu.item(CMD_SIZE_BASE + i, label, key == active_size)
+        menu.attach("长条大小", size_menu)
+
+        field_menu = MenuBuilder.submenu()
+        shown = stripopts.enabled_fields(self.cfg)
+        for i, (key, label) in enumerate(stripopts.FIELDS):
+            is_on = key in shown
+            # 只剩一项时把它灰掉：长条总得显示点什么，最后一项不允许取消。
+            # 直接灰掉比「点了弹框说不行」清爽得多。
+            field_menu.item(CMD_FIELD_BASE + i, label, is_on,
+                            enabled=not (is_on and len(shown) <= 1))
+        menu.attach("长条显示内容", field_menu)
         menu.separator()
         menu.item(CMD_FEE_SETTINGS, "电价设置…")
         menu.item(CMD_OPEN_CONFIG, "打开配置文件")
@@ -241,6 +275,9 @@ class PowerMonitorApp:
 
     def _on_command(self, cmd: int) -> None:
         try:
+            # 长条外观 / 内容类命令号落在各自的区间里，先让它们吃掉
+            if self._apply_strip_option(cmd):
+                return
             if cmd == CMD_TOGGLE_PANEL:
                 self._toggle_panel()
             elif cmd in _MODE_BY_CMD:
@@ -263,6 +300,55 @@ class PowerMonitorApp:
                 self.quit()
         except Exception:  # noqa: BLE001 - 菜单动作失败不能拖垮消息循环
             pass
+
+    def _apply_strip_option(self, cmd: int) -> bool:
+        """处理「长条质感 / 字号 / 大小 / 显示内容」的命令号。
+
+        这几档的命令号是「基址 + 目录下标」的连续区间（见 tray.CMD_*_BASE），
+        所以不用为每一档写一个分支。不是这类命令就返回 False，让调用方继续往下判。
+        """
+        pick = None
+        if CMD_THEME_BASE <= cmd < CMD_THEME_BASE + len(stripopts.THEMES):
+            pick = ("theme", stripopts.THEMES[cmd - CMD_THEME_BASE][0])
+        elif CMD_FONT_BASE <= cmd < CMD_FONT_BASE + len(stripopts.FONT_SCALES):
+            pick = ("font", stripopts.FONT_SCALES[cmd - CMD_FONT_BASE][0])
+        elif CMD_SIZE_BASE <= cmd < CMD_SIZE_BASE + len(stripopts.SIZES):
+            pick = ("size", stripopts.SIZES[cmd - CMD_SIZE_BASE][0])
+        elif CMD_FIELD_BASE <= cmd < CMD_FIELD_BASE + len(stripopts.FIELDS):
+            pick = ("field", stripopts.FIELDS[cmd - CMD_FIELD_BASE][0])
+        if pick is None:
+            return False
+        self._set_strip_option(*pick)
+        return True
+
+    def _set_strip_option(self, kind: str, value) -> None:
+        """改长条外观 / 显示内容：存盘 + 立刻重画。
+
+        不重建窗口 —— ``_content_key`` 里已经带了质感 / 字号 / 大小 / 字段，配置一变
+        键就变，下一帧 ``_render_if_needed`` 自然会重画。字号或大小引起高度变化时，
+        ``tick`` 还会顺手把窗口挪到按新高度算出来的位置。
+        """
+        if kind == "theme":
+            if self.cfg.strip_theme == value:
+                return
+            self.cfg.strip_theme = value
+        elif kind == "font":
+            if abs(stripopts.font_scale(self.cfg) - value) < 1e-6:
+                return
+            self.cfg.strip_font_scale = value
+        elif kind == "size":
+            if self.cfg.strip_size == value:
+                return
+            self.cfg.strip_size = value
+        elif kind == "field":
+            # 最后一项不允许取消：toggle_field 会拒绝并返回 False（菜单里也已灰掉）
+            if not stripopts.toggle_field(self.cfg, value):
+                return
+        else:
+            return
+        self.cfg.save()
+        self.strip.invalidate()
+        self._ensure_strip()
 
     # ------------------------------------------------------------- 消息
 
@@ -792,6 +878,144 @@ def self_test() -> int:
             check("长条离屏缓冲能建出来", False, "CreateDIBSection 失败")
     finally:
         gdi32.DeleteDC(strip_dc)
+        user32.ReleaseDC(None, screen_dc)
+
+    # ---- 长条外观档位（质感 / 字号 / 大小 / 显示内容）----
+    # 这几档最典型的故障是「菜单里有、渲染不认识」和「点完没反应」，所以不能只查
+    # 配置值 —— 每一档都得真的离屏画一遍，检查像素。
+    base = config_mod.Config()
+
+    def _variant(**over):
+        """造一份只改了指定几项的长条配置。Config 是纯 dataclass，直接改属性。"""
+        made = config_mod.Config()
+        for name, val in over.items():
+            setattr(made, name, val)
+        return made
+
+    check("长条质感有 6 档", len(stripopts.THEMES) == 6,
+          "、".join(stripopts.THEME_KEYS))
+    check("长条字号有 5 档", len(stripopts.FONT_SCALES) == 5)
+    check("长条大小有 3 档", len(stripopts.SIZES) == 3)
+    # 关键回归：默认档必须和改造前**一模一样**，否则老用户升个级长条就变高度了
+    check("默认档高度比例仍是 0.78",
+          abs(stripopts.height_ratio(base) - 0.78) < 1e-9,
+          f"{stripopts.height_ratio(base):.4f}")
+    size_ratios = [stripopts.height_ratio(_variant(strip_size=k))
+                   for k in ("slim", "normal", "large")]
+    check("长条大小三档高度递增",
+          all(a < b for a, b in zip(size_ratios, size_ratios[1:])),
+          " < ".join(f"{r:.3f}" for r in size_ratios))
+    font_ratios = [stripopts.height_ratio(_variant(strip_font_scale=v))
+                   for v, _label in stripopts.FONT_SCALES]
+    check("长条字号五档高度递增",
+          all(a < b for a, b in zip(font_ratios, font_ratios[1:])),
+          " < ".join(f"{r:.3f}" for r in font_ratios))
+
+    solo = _variant(strip_fields=["current"])
+    check("最后一项显示内容不允许取消",
+          stripopts.toggle_field(solo, "current") is False
+          and solo.strip_fields == ["current"])
+    order = _variant(strip_fields=["current", "uptime"])
+    stripopts.toggle_field(order, "cpu")
+    check("新勾的项按目录顺序插回（不甩到末尾）",
+          order.strip_fields == ["current", "cpu", "uptime"], str(order.strip_fields))
+    bad = _variant(strip_theme="neon", strip_size="huge", strip_font_scale=9.0,
+                   strip_fields=["nope"])
+    # 字号是「夹到最近的合法档」，不是重置成默认 —— 9.0 最近的是 1.5（巨大）。
+    # 关键是别让一个手改出来的离谱值把长条撑爆。
+    check("手改出来的非法配置能夹回合法档",
+          stripopts.sanitize(bad) is True and bad.strip_theme == "auto"
+          and bad.strip_size == "normal" and bad.strip_font_scale == 1.5
+          and bad.strip_fields == list(stripopts.DEFAULT_FIELDS),
+          f"{bad.strip_theme}/{bad.strip_size}/{bad.strip_font_scale}/{bad.strip_fields}")
+
+    screen_dc = user32.GetDC(None)
+    theme_dc = gdi32.CreateCompatibleDC(screen_dc)
+    try:
+        probe_h = 47
+
+        def _paint(strip_obj, height):
+            """离屏画一帧，返回 (宽, 内部中间一行的 alpha 列表, 该帧配色)。"""
+            wide = strip_obj._layout(theme_dc, 1.0, _ProbeSnap(), render=False)[0]
+            bmp, view = dib_section(theme_dc, wide, height)
+            if not bmp:
+                return 0, [], None
+            old = gdi32.SelectObject(theme_dc, bmp)
+            # _highlight 要写 self._view，离屏路径下得手动挂上（正常路径由
+            # _render_if_needed 建缓冲区时挂）
+            strip_obj._view, strip_obj._w, strip_obj._h = view, wide, height
+            _t, _h, pal = strip_obj._layout(
+                theme_dc, 1.0, _ProbeSnap(), render=True,
+                origin_x=0, origin_y=0, height=height,
+            )
+            compose_shape_alpha(view, wide, height, margin=0, radius=height / 2.0,
+                                shape_w=wide, shape_h=height, shadow=0,
+                                shape_alpha=pal["alpha"], key_rgb=pal["key"])
+            mid = height // 2
+            row = [view[(mid * wide + x) * 4 + 3] for x in range(4, wide - 4)]
+            gdi32.SelectObject(theme_dc, old)
+            gdi32.DeleteObject(bmp)
+            return wide, row, pal
+
+        for theme_key, theme_label, _hint in stripopts.THEMES:
+            probe = TaskbarStrip(_variant(strip_theme=theme_key))
+            try:
+                _w, row, pal = _paint(probe, probe_h)
+                if pal is None:
+                    check(f"质感「{theme_label}」离屏缓冲建得出", False,
+                          "CreateDIBSection 失败")
+                    continue
+                lit = sum(1 for a in row if a > 0)
+                if theme_key == "outline":
+                    # 线框：底色被抠成透明，只剩描边和文字 —— 既不能整片实心，
+                    # 也不能整片全空（那说明抠色把描边和文字一起抠掉了）
+                    ok = 0 < lit < len(row)
+                    detail = f"可见 {lit}/{len(row)}px"
+                else:
+                    invisible = [a for a in row if a != pal["alpha"]]
+                    ok = not invisible
+                    detail = (f"alpha={pal['alpha']} 全部命中" if ok
+                              else f"异常 alpha：{sorted(set(invisible))}")
+                check(f"质感「{theme_label}」画得出来且内部无空洞", ok, detail)
+            finally:
+                probe.destroy()
+
+        # ---- 半透明合成必须「逐行一致」----
+        # 这里埋过一个极隐蔽的坑：compose_shape_alpha 里 inside() 是闭包，捕获的是
+        # 外层的 k；而「边缘」和「阴影」两个分支也往 k 里写值，于是每行一旦处理过
+        # 一个边缘像素，该行之后所有内部像素就都按那个边缘像素的系数去乘 RGB ——
+        # 画面上是规则的横向条纹。老代码里就有，但长条一直是不透明 255（走不到
+        # 这条分支）所以没暴露，加了半透明质感才炸出来。
+        # 用一块纯色内存缓冲直接调它、逐行断言，最能抓住这类「逐行不一致」。
+        cw, ch = 240, 40
+        buf = (ctypes.c_ubyte * (cw * ch * 4))()
+        for i in range(cw * ch):
+            buf[i * 4] = 0xF0        # B
+            buf[i * 4 + 1] = 0xE8    # G
+            buf[i * 4 + 2] = 0xE0    # R
+        compose_shape_alpha(buf, cw, ch, margin=0, radius=ch / 2.0,
+                            shape_w=cw, shape_h=ch, shadow=0, shape_alpha=200)
+        mid_x = cw // 2
+        rows = {tuple(buf[(y * cw + mid_x) * 4:(y * cw + mid_x) * 4 + 4])
+                for y in range(ch // 4, ch * 3 // 4)}
+        check("半透明合成逐行一致（没有横条纹）", len(rows) == 1,
+              f"{len(rows)} 种：{sorted(rows)[:4]}")
+
+        # 大字号 + 宽大：内容更宽更高，但仍不能有空洞。（顺带验证字体缓存的键
+        # 带了字号倍率 —— 不带的话这里会拿回标准字号的字体，宽度就不会变）
+        plain = TaskbarStrip(base)
+        small_w = plain._layout(theme_dc, 1.0, _ProbeSnap(), render=False)[0]
+        plain.destroy()
+        big = TaskbarStrip(_variant(strip_font_scale=1.5, strip_size="large"))
+        big_h = max(18, int(round(48 * stripopts.height_ratio(big.cfg))))
+        big_w, big_row, big_pal = _paint(big, big_h)
+        check("字号调大会让长条变宽", big_w > small_w, f"{small_w}px → {big_w}px")
+        check("大字号 + 宽大档内部无空洞",
+              bool(big_row) and all(a == big_pal["alpha"] for a in big_row),
+              f"alpha={sorted(set(big_row)) if big_row else '无数据'}")
+        big.destroy()
+    finally:
+        gdi32.DeleteDC(theme_dc)
         user32.ReleaseDC(None, screen_dc)
 
     info = taskbar.taskbar()

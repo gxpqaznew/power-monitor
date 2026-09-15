@@ -1,6 +1,6 @@
 开机能耗统计 v1.0.0 自检
 frozen=False  python=3.13.14
-exe=C:\Users\gxp\.workbuddy\binaries\python\versions\3.13.12\python.exe
+exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
 [PASS] 内置省份电价预设已打进包  (30 个)
 [PASS] 时段解析可用（23-7 跨零点）
@@ -10,11 +10,29 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\versions\3.13.12\python.exe
 [PASS] 长条能排出 4 个字段
 [PASS] 长条宽度算得出来  (651px)
 [PASS] 长条内部 alpha 补满（没有透明空洞）  (651/651)
-[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=919)
+[PASS] 长条质感有 6 档  (auto、glass、outline、dark、light、accent)
+[PASS] 长条字号有 5 档
+[PASS] 长条大小有 3 档
+[PASS] 默认档高度比例仍是 0.78  (0.7800)
+[PASS] 长条大小三档高度递增  (0.620 < 0.780 < 0.920)
+[PASS] 长条字号五档高度递增  (0.750 < 0.780 < 0.810 < 0.845 < 0.881)
+[PASS] 最后一项显示内容不允许取消
+[PASS] 新勾的项按目录顺序插回（不甩到末尾）  (['current', 'cpu', 'uptime'])
+[PASS] 手改出来的非法配置能夹回合法档  (auto/normal/1.5/['current', 'cost', 'session', 'today'])
+[PASS] 质感「跟随任务栏」画得出来且内部无空洞  (alpha=255 全部命中)
+[PASS] 质感「玻璃」画得出来且内部无空洞  (alpha=200 全部命中)
+[PASS] 质感「线框」画得出来且内部无空洞  (可见 243/517px)
+[PASS] 质感「深色卡片」画得出来且内部无空洞  (alpha=236 全部命中)
+[PASS] 质感「浅色卡片」画得出来且内部无空洞  (alpha=242 全部命中)
+[PASS] 质感「强调色」画得出来且内部无空洞  (alpha=244 全部命中)
+[PASS] 半透明合成逐行一致（没有横条纹）  (1 种：[(188, 181, 175, 200)])
+[PASS] 字号调大会让长条变宽  (525px → 742px)
+[PASS] 大字号 + 宽大档内部无空洞  (alpha=[255])
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=836)
 [PASS] 电价设置窗口能建出来
 [PASS] 省份项数 = 预设数 + 1 个自定义
 [PASS] 打开时定位到默认省份  (四川)
 [PASS] 下拉框第 1 项文字是「四川」  ('四川')
 [PASS] 方案下拉框有内容
 
-通过 14 项，失败 0 项
+通过 32 项，失败 0 项

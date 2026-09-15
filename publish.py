@@ -8,6 +8,8 @@
 
 做的事：
 1. 读 installer/PowerMonitor.nsi 的 APP_VERSION，补丁号 +1（或 --version 指定）；
+   同时把 powermon/__init__.py 的 __version__ 写成同一个值（「关于」对话框读它，
+   不同步的话关于里会一直显示老版本号）；
 2. 重包 exe（旧的 dist/能耗统计.exe 先 os.replace 移到临时目录，避开安全删除守卫）；
 3. 重包安装包（旧的 *安装程序*.exe 同样移走）；
 4. 若当前在 git 仓库，提交 NSIS 版本变更；
@@ -27,6 +29,7 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
 NSIS = PROJECT / "installer" / "PowerMonitor.nsi"
+INIT_PY = PROJECT / "powermon" / "__init__.py"
 DIST = PROJECT / "dist"
 SPEC = PROJECT / "PowerMonitor.spec"
 DEFAULT_REPO = "gxpqaznew/power-monitor"
@@ -38,6 +41,7 @@ PY = (os.environ.get("PYW_EXE")
 TEMP_BUILD = str(Path(tempfile.gettempdir()) / "powermon_build")
 
 _VERSION_RE = re.compile(r'(!define\s+APP_VERSION\s+")([\d.]+)(")')
+_INIT_VERSION_RE = re.compile(r'(__version__\s*=\s*")([\d.]+)(")')
 
 
 def _run(cmd, **kw):
@@ -57,6 +61,27 @@ def write_version(ver: str) -> None:
     text = NSIS.read_text(encoding="utf-8-sig")
     new = _VERSION_RE.sub(lambda _m: f'{_m.group(1)}{ver}{_m.group(3)}', text, count=1)
     NSIS.write_text(new, encoding="utf-8-sig")
+
+
+def read_init_version() -> str:
+    m = _INIT_VERSION_RE.search(INIT_PY.read_text(encoding="utf-8"))
+    return m.group(2) if m else ""
+
+
+def write_init_version(ver: str) -> None:
+    """把 ``powermon/__init__.py`` 的 ``__version__`` 也一起改掉。
+
+    发布版本号的真源是 NSIS 的 ``APP_VERSION``（安装包文件名、注册表版本都用它），
+    但托盘菜单「关于」显示的是 ``__init__.py`` 里的 ``__version__``。两边不同步的话
+    关于对话框会永远显示一个老版本号 —— 之前就踩过（NSIS 已经 1.0.4，关于还写着
+    1.0.0），所以这里强制一起写。
+    """
+    text = INIT_PY.read_text(encoding="utf-8")
+    new, count = _INIT_VERSION_RE.subn(
+        lambda _m: f'{_m.group(1)}{ver}{_m.group(3)}', text, count=1)
+    if not count:
+        raise SystemExit("powermon/__init__.py 里找不到 __version__ 定义")
+    INIT_PY.write_text(new, encoding="utf-8")
 
 
 def bump(ver: str) -> str:
@@ -232,8 +257,15 @@ def main() -> int:
     old_ver = read_version()
     ver = args.version or bump(old_ver)
     print(f"版本 {old_ver} -> {ver}")
+    init_old = read_init_version()
+    if init_old != old_ver:
+        print(f"  （__init__.py 里的 __version__ 是 {init_old}，先对齐到 {ver}）")
 
     write_version(ver)
+    write_init_version(ver)
+    # 自检一下：两个地方必须一致，否则「关于」又会显示错版本
+    if read_version() != read_init_version():
+        raise SystemExit("版本号没写一致：检查 NSIS 与 __init__.py")
     build_exe()
     installer = build_installer()
     print(f"安装包：{installer}  ({installer.stat().st_size/1048576:.2f} MB)")

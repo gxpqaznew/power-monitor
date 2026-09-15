@@ -79,6 +79,23 @@ class Config:
     #   tray   通知区域左边。开始按钮查不到、或左边放不下时也自动退到这儿。
     strip_position: str = "start"
 
+    # ---- 任务栏长条 · 外观与内容 ----
+    # 下面这几项都能在托盘右键菜单的二级子菜单里改：
+    # 「长条质感 ▸」「长条字号 ▸」「长条大小 ▸」「长条显示内容 ▸」
+    # 每一项的取值清单见 powermon/stripopts.py —— 那是菜单、配置校验、渲染
+    # 三处共用的唯一真源，加档位只改那一个文件。
+    # 质感：auto 跟随任务栏 / glass 玻璃 / outline 线框 /
+    #       dark 深色卡片 / light 浅色卡片 / accent 强调色
+    strip_theme: str = "auto"
+    # 字号倍数：0.85 小 / 1.0 标准 / 1.15 大 / 1.32 特大 / 1.5 巨大
+    strip_font_scale: float = 1.0
+    # 尺寸：slim 纤细 / normal 标准 / large 宽大（影响胶囊高度与左右内边距）
+    strip_size: str = "normal"
+    # 显示哪些字段、按什么顺序（从左到右）。字段清单见 stripopts.FIELDS
+    strip_fields: list = field(
+        default_factory=lambda: ["current", "cost", "session", "today"]
+    )
+
     # ---- 整机口径 ----
     # 是否把显示器功耗计入（显示器一般独立计量，默认不计）
     include_monitor: bool = False
@@ -98,6 +115,12 @@ class Config:
             known = {f.name for f in fields(cls)}
             cfg = cls(**{k: v for k, v in raw.items() if k in known})
             cfg._backfill(raw)
+            # 长条的外观/内容项可能是旧配置里没有的，也可能被手改成了不认识的值
+            # （比如 strip_font_scale 写成 3.0 会把长条撑爆）。统一在这儿夹回合法值。
+            from . import stripopts
+
+            if stripopts.sanitize(cfg):
+                cfg.save()
             return cfg
         cfg = cls()
         cfg.save()

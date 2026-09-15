@@ -54,6 +54,11 @@ WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_QUIT = 0x0012
 WM_PAINT = 0x000F
+# 关机 / 注销：Windows 会给每个顶层窗口发这两个消息，等窗口回话。
+# 收到 QUERYENDSESSION 就该把账本落盘 —— 这是「正常关机」路径上最后的机会，
+# 之后进程可能连 atexit 都跑不到。
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
 WM_TIMER = 0x0113
 WM_COMMAND = 0x0111
 WM_ERASEBKGND = 0x0014

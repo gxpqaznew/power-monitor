@@ -26,7 +26,7 @@ Unicode true
 !define APP_NAME      "开机能耗统计"
 !define APP_EXE       "能耗统计.exe"
 !define APP_ID        "PowerMonitor"
-!define APP_VERSION   "1.0.5"
+!define APP_VERSION   "1.0.6"
 !define APP_PUBLISHER "本地构建"
 
 !define UNINST_EXE "卸载 ${APP_NAME}.exe"

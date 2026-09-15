@@ -1,4 +1,4 @@
-开机能耗统计 v1.0.0 自检
+开机能耗统计 v1.0.5 自检
 frozen=False  python=3.13.14
 exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
@@ -28,11 +28,24 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 半透明合成逐行一致（没有横条纹）  (1 种：[(188, 181, 175, 200)])
 [PASS] 字号调大会让长条变宽  (525px → 742px)
 [PASS] 大字号 + 宽大档内部无空洞  (alpha=[255])
-[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=836)
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=891)
 [PASS] 电价设置窗口能建出来
 [PASS] 省份项数 = 预设数 + 1 个自定义
 [PASS] 打开时定位到默认省份  (四川)
 [PASS] 下拉框第 1 项文字是「四川」  ('四川')
 [PASS] 方案下拉框有内容
+[PASS] 账本放在固定的用户数据目录（不跟 exe 走）  (C:\Users\gxp\AppData\Local\PowerMonitor)
+[PASS] 旧版的单日数字折进了每日账本  (['2026-09-15'])
+[PASS] 本月电量 = 当月各天之和  (2592.2 Wh / 1 天)
+[PASS] 累计电量沿用旧账  (3605.7 Wh)
+[PASS] 旧账缺 total_cost 时按每日账本补齐  (¥1.11)
+[PASS] 落盘能读回每日账本  (['2026-09-15'])
+[PASS] 落盘带 total_cost  (1.1112)
+[PASS] 每日账本保留 400 天上限  (400)
+[PASS] 落盘间隔缩到 15 秒内（少丢数据）  (15.0s)
+[PASS] 累计类长条字段都算得出文本  ({'month': ('本月', '12.3', 'kWh'), 'total': ('累计', '156.70', 'kWh'), 'total_cost': ('累计电费', '¥81.90', '')})
+[PASS] 每一档都能反查出它属于哪级子菜单  ({'theme': True, 'font': True, 'size': True, 'field': True})
+[PASS] 普通命令不会被当成选项（锚点为 None）
+[PASS] 每级子菜单都能单独建出来（继续弹的前提）  ([True, True, True, True])
 
-通过 32 项，失败 0 项
+通过 45 项，失败 0 项

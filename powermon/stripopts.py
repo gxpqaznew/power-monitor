@@ -67,6 +67,10 @@ FIELDS = [
     ("peak", "峰值功率"),
     ("uptime", "开机时长"),
     ("segment", "当前时段"),
+    # 累计类放在最后：默认不勾，勾上就按 FIELDS 顺序排在长条最右边。
+    ("month", "本月电量"),
+    ("total", "累计电量"),
+    ("total_cost", "累计电费"),
 ]
 FIELD_KEYS = tuple(k for k, _ in FIELDS)
 FIELD_LABEL = dict(FIELDS)
@@ -169,6 +173,13 @@ def field_value(key: str, snap, cfg) -> tuple[str, str, str] | None:
         return ("开机", _short_duration(snap.power_on_seconds), "")
     if key == "segment":
         return ("时段", str(getattr(snap, "segment", "") or ""), "")
+    if key == "month":
+        return ("本月", f"{snap.month_wh / 1000:.1f}", "kWh")
+    if key == "total":
+        value, unit = _energy(snap.total_wh)
+        return ("累计", value, unit)
+    if key == "total_cost":
+        return ("累计电费", f"{cur}{snap.total_cost:.2f}", "")
     return None
 
 

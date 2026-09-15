@@ -737,7 +737,9 @@ class Panel:
                    self._font("cap", 12), INK_DIM, extra=self.s(1))
         self._text(dc, f"CPU 负载 {snap.cpu_util:.0f}%", ix, cy, half, self.s(15),
                    self._font("tiny", 10), INK_FAINT, DT_RIGHT)
-        self._text(dc, "今日累计", rx, cy, right_w, self.s(15),
+        # 右半栏改成「总统计」：今日 / 本月 / 累计。
+        # 只给一个「今日」看不出历史，用户要的是「以前的记录也留着、能看总的」。
+        self._text(dc, "总统计", rx, cy, right_w, self.s(15),
                    self._font("cap", 12), INK_DIM, extra=self.s(1))
         cy += self.s(19)
 
@@ -748,15 +750,29 @@ class Panel:
         self._text(dc, "W", ix + lw + self.s(6), cy + self.s(10), half, self.s(18),
                    self._font("unit", 12), INK_DIM)
 
-        right_val = f"{snap.today_wh / 1000:.2f}"
-        self._text(dc, right_val, rx, cy, right_w, self.s(32), num_font, INK)
-        rw = self._text_width(dc, right_val, num_font)
-        self._text(dc, "kWh", rx + rw + self.s(6), cy + self.s(10), self.s(38),
-                   self.s(18), self._font("unit", 12), INK_DIM)
-        self._text(dc, f"≈ {self.cfg.currency}{snap.today_cost:.2f}",
-                   rx, cy + self.s(22), right_w, self.s(16),
-                   self._font("strong", 11, bold=True), ACCENT, DT_RIGHT)
-        cy += self.s(38)
+        # 三行总统计：标签 + 电量 + 电费，纵向排布省高度（卡片高度是固定的）
+        row_h = self.s(14)
+        label_w = self.s(26)
+        cost_w = self.s(56)
+        value_w = right_w - label_w - cost_w - self.s(4)
+        ry = cy
+        for label, wh, cost in (
+            ("今日", snap.today_wh, snap.today_cost),
+            ("本月", snap.month_wh, snap.month_cost),
+            ("累计", snap.total_wh, snap.total_cost),
+        ):
+            self._text(dc, label, rx, ry, label_w, row_h,
+                       self._font("tiny", 10), INK_FAINT)
+            value, unit = fmt_energy(wh)
+            self._text(dc, f"{value} {unit}", rx + label_w, ry, value_w, row_h,
+                       self._font("strong", 11, bold=True), INK, DT_RIGHT)
+            self._text(dc, f"{self.cfg.currency}{cost:.2f}",
+                       rx + label_w + value_w + self.s(4), ry, cost_w, row_h,
+                       self._font("tiny", 10), ACCENT, DT_RIGHT)
+            ry += row_h
+
+        # 竖直方向取「左栏大数字」和「右栏三行」里更高的那个，两边都不会被压到
+        cy = max(cy + self.s(38), ry)
 
         # 两格之间的竖分隔线
         self._line(dc, ix + half + self.s(6), y + self.s(16),

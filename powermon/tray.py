@@ -62,6 +62,10 @@ CMD_FONT_BASE = 60       # 60..69  长条字号（strippts.FONT_SCALES 下标）
 CMD_SIZE_BASE = 70       # 70..79  长条大小（strippts.SIZES 下标）
 CMD_FIELD_BASE = 80      # 80..99  长条显示内容（strippts.FIELDS 下标，勾选式）
 
+# 「选项类」子菜单点完继续弹的上限。正常用不到这么多，纯粹防呆：
+# 万一 on_command 的返回值出问题，也不会变成死循环把程序卡死。
+MAX_POPUP_ROUNDS = 40
+
 _CLASS_NAME = "PowerMonitorTrayWnd"
 _windows: dict[int, "TrayIcon"] = {}
 _wndproc_ref: WNDPROC | None = None  # 必须持引用，否则回调被 GC 掉会崩
@@ -253,22 +257,40 @@ class TrayIcon:
 
         return False, 0
 
-    def _popup(self) -> None:
-        menu = self._build_menu()
-        if not menu:
-            return
-        point = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(point))
-        # 必须先置前台，否则点菜单外面菜单不会消失
-        user32.SetForegroundWindow(self._hwnd)
-        command = user32.TrackPopupMenu(
-            menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
-            point.x, point.y, 0, self._hwnd, None,
-        )
-        user32.PostMessageW(self._hwnd, 0, 0, 0)
-        user32.DestroyMenu(menu)
-        if command:
-            self._on_command(int(command))
+    def _popup(self, anchor: str | None = None) -> None:
+        """弹出菜单，并支持「选项类」子菜单连着点。
+
+        Win32 的弹出菜单**选中一项就必然关闭** —— 这是系统行为，改不了。而
+        「长条显示内容」是勾选式的，用户往往要连着勾三四项，每次都得回托盘重新
+        右键，非常烦。所以这里用「同一位置重新弹同一个子菜单」来模拟「菜单不关」：
+
+            build_menu(anchor) 传入锚点 → 只返回那一级子菜单（重建过，勾选状态是新的）
+            on_command(cmd) 的返回值就是下一个要继续弹的锚点，返回 None 表示正常关闭
+
+        位置固定用第一次弹出的坐标：菜单才不会点一下跳一下。
+        """
+        origin = None
+        for _ in range(MAX_POPUP_ROUNDS):
+            menu = self._build_menu(anchor)
+            if not menu:
+                return
+            if origin is None:
+                point = wintypes.POINT()
+                user32.GetCursorPos(ctypes.byref(point))
+                origin = (point.x, point.y)
+            # 必须先置前台，否则点菜单外面菜单不会消失
+            user32.SetForegroundWindow(self._hwnd)
+            command = user32.TrackPopupMenu(
+                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                origin[0], origin[1], 0, self._hwnd, None,
+            )
+            user32.PostMessageW(self._hwnd, 0, 0, 0)
+            user32.DestroyMenu(menu)
+            if not command:
+                return                      # 点空白处关掉了
+            anchor = self._on_command(int(command))
+            if not anchor:
+                return                      # 普通命令：照常关闭
 
 
 # --------------------------------------------------------------------- 菜单构建

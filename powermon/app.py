@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import sys
 import threading
@@ -55,7 +56,9 @@ from .w32 import (
     MB_ICONWARNING,
     MB_OK,
     MB_YESNO,
+    WM_ENDSESSION,
     WM_PIN_READY,
+    WM_QUERYENDSESSION,
     WM_TIMER,
     WM_TRAY_READDED,
     gdi32,
@@ -197,14 +200,75 @@ class PowerMonitorApp:
 
     # ------------------------------------------------------------- 菜单
 
-    def _build_menu(self):
+    # 四个「选项类」子菜单的锚点。两件事共用同一套名字：
+    #   · _build_menu(anchor) 只返回这一级（点完接着弹用，见 tray.TrayIcon._popup）
+    #   · _apply_strip_option(cmd) 返回该命令所属的锚点
+    STRIP_MENUS = ("theme", "font", "size", "field")
+
+    def _menu_theme(self) -> "MenuBuilder":
+        menu = MenuBuilder.submenu()
+        active = stripopts.theme(self.cfg)
+        for i, (key, label, _hint) in enumerate(stripopts.THEMES):
+            menu.item(CMD_THEME_BASE + i, label, key == active)
+        return menu
+
+    def _menu_font(self) -> "MenuBuilder":
+        menu = MenuBuilder.submenu()
+        active = stripopts.font_scale(self.cfg)
+        for i, (value, label) in enumerate(stripopts.FONT_SCALES):
+            menu.item(CMD_FONT_BASE + i, label, abs(value - active) < 1e-6)
+        return menu
+
+    def _menu_size(self) -> "MenuBuilder":
+        menu = MenuBuilder.submenu()
+        active = stripopts.size_key(self.cfg)
+        for i, (key, label, _ratio, _pad) in enumerate(stripopts.SIZES):
+            menu.item(CMD_SIZE_BASE + i, label, key == active)
+        return menu
+
+    def _menu_field(self) -> "MenuBuilder":
+        menu = MenuBuilder.submenu()
+        shown = stripopts.enabled_fields(self.cfg)
+        for i, (key, label) in enumerate(stripopts.FIELDS):
+            is_on = key in shown
+            # 只剩一项时把它灰掉：长条总得显示点什么，最后一项不允许取消。
+            # 直接灰掉比「点了弹框说不行」清爽得多。
+            menu.item(CMD_FIELD_BASE + i, label, is_on,
+                      enabled=not (is_on and len(shown) <= 1))
+        return menu
+
+    def _build_menu(self, anchor: str | None = None):
+        """构建托盘菜单。
+
+        ``anchor`` 命中 ``STRIP_MENUS`` 时**只返回那一级子菜单**：用户勾完一个
+        显示字段后，在同一位置立刻再弹出同一级，可以连着勾 —— 否则每勾一项
+        菜单就关掉，得回托盘重新点右键（用户投诉的就是这个）。
+        """
+        if anchor in self.STRIP_MENUS:
+            return getattr(self, f"_menu_{anchor}")().handle
+
         snap = self.meter.snapshot()
+        cur = self.cfg.currency
         menu = MenuBuilder()
         menu.label("本次开机", fmt_duration(snap.power_on_seconds))
         menu.label(
             "已统计能耗",
-            f"{snap.session_wh:.0f} Wh · {self.cfg.currency}{snap.session_cost:.3f}",
+            f"{snap.session_wh:.0f} Wh · {cur}{snap.session_cost:.3f}",
         )
+        menu.separator()
+
+        # 总统计：用户要「后面能看总统计」，就放在右键一下就能看到的位置，
+        # 不必先打开面板。（累计 = 开这个程序以来所有天的总和）
+        menu.label("今日", f"{snap.today_wh / 1000:.2f} kWh · {cur}{snap.today_cost:.2f}")
+        menu.label(
+            "本月",
+            f"{snap.month_wh / 1000:.1f} kWh · {cur}{snap.month_cost:.2f}",
+        )
+        menu.label(
+            "累计",
+            f"{snap.total_wh / 1000:.1f} kWh · {cur}{snap.total_cost:.2f}",
+        )
+        menu.label("已记录", f"{snap.total_days} 天 · 开机 {snap.total_sessions} 次")
         menu.separator()
 
         menu.item(CMD_TOGGLE_PANEL, "打开详情面板")
@@ -216,7 +280,7 @@ class PowerMonitorApp:
         )
         display.item(
             CMD_MODE_COST,
-            f"已用电费 ({self.cfg.currency})",
+            f"已用电费 ({cur})",
             self.cfg.tray_display == "cost",
         )
         display.item(
@@ -234,33 +298,11 @@ class PowerMonitorApp:
 
         # 长条外观 / 内容：都做成根菜单下的**二级**子菜单（右键图标点两下就到），
         # 不往三级里塞 —— 用户的原话是「角标点开后在二级菜单里调」，层级一深就没人找了。
-        theme_menu = MenuBuilder.submenu()
-        active_theme = stripopts.theme(self.cfg)
-        for i, (key, label, _hint) in enumerate(stripopts.THEMES):
-            theme_menu.item(CMD_THEME_BASE + i, label, key == active_theme)
-        menu.attach("长条质感", theme_menu)
-
-        font_menu = MenuBuilder.submenu()
-        active_scale = stripopts.font_scale(self.cfg)
-        for i, (value, label) in enumerate(stripopts.FONT_SCALES):
-            font_menu.item(CMD_FONT_BASE + i, label, abs(value - active_scale) < 1e-6)
-        menu.attach("长条字号", font_menu)
-
-        size_menu = MenuBuilder.submenu()
-        active_size = stripopts.size_key(self.cfg)
-        for i, (key, label, _ratio, _pad) in enumerate(stripopts.SIZES):
-            size_menu.item(CMD_SIZE_BASE + i, label, key == active_size)
-        menu.attach("长条大小", size_menu)
-
-        field_menu = MenuBuilder.submenu()
-        shown = stripopts.enabled_fields(self.cfg)
-        for i, (key, label) in enumerate(stripopts.FIELDS):
-            is_on = key in shown
-            # 只剩一项时把它灰掉：长条总得显示点什么，最后一项不允许取消。
-            # 直接灰掉比「点了弹框说不行」清爽得多。
-            field_menu.item(CMD_FIELD_BASE + i, label, is_on,
-                            enabled=not (is_on and len(shown) <= 1))
-        menu.attach("长条显示内容", field_menu)
+        # 这四项点完会**继续留在原地**，方便连着调。
+        menu.attach("长条质感", self._menu_theme())
+        menu.attach("长条字号", self._menu_font())
+        menu.attach("长条大小", self._menu_size())
+        menu.attach("长条显示内容", self._menu_field())
         menu.separator()
         menu.item(CMD_FEE_SETTINGS, "电价设置…")
         menu.item(CMD_OPEN_CONFIG, "打开配置文件")
@@ -273,11 +315,17 @@ class PowerMonitorApp:
 
     # ------------------------------------------------------------- 命令
 
-    def _on_command(self, cmd: int) -> None:
+    def _on_command(self, cmd: int) -> str | None:
+        """处理菜单命令。
+
+        返回值是**下一个要继续弹出的子菜单锚点**（``None`` = 菜单照常关闭）。
+        托盘那边拿它实现「勾完一项菜单不消失」。
+        """
         try:
             # 长条外观 / 内容类命令号落在各自的区间里，先让它们吃掉
-            if self._apply_strip_option(cmd):
-                return
+            anchor = self._apply_strip_option(cmd)
+            if anchor is not None:
+                return anchor
             if cmd == CMD_TOGGLE_PANEL:
                 self._toggle_panel()
             elif cmd in _MODE_BY_CMD:
@@ -300,26 +348,33 @@ class PowerMonitorApp:
                 self.quit()
         except Exception:  # noqa: BLE001 - 菜单动作失败不能拖垮消息循环
             pass
+        return None
 
-    def _apply_strip_option(self, cmd: int) -> bool:
+    def _apply_strip_option(self, cmd: int) -> str | None:
         """处理「长条质感 / 字号 / 大小 / 显示内容」的命令号。
 
         这几档的命令号是「基址 + 目录下标」的连续区间（见 tray.CMD_*_BASE），
-        所以不用为每一档写一个分支。不是这类命令就返回 False，让调用方继续往下判。
+        所以不用为每一档写一个分支。返回该命令所属子菜单的锚点（用于点完继续
+        弹同一级），不是这类命令就返回 None，让调用方继续往下判。
         """
         pick = None
+        anchor = None
         if CMD_THEME_BASE <= cmd < CMD_THEME_BASE + len(stripopts.THEMES):
             pick = ("theme", stripopts.THEMES[cmd - CMD_THEME_BASE][0])
+            anchor = "theme"
         elif CMD_FONT_BASE <= cmd < CMD_FONT_BASE + len(stripopts.FONT_SCALES):
             pick = ("font", stripopts.FONT_SCALES[cmd - CMD_FONT_BASE][0])
+            anchor = "font"
         elif CMD_SIZE_BASE <= cmd < CMD_SIZE_BASE + len(stripopts.SIZES):
             pick = ("size", stripopts.SIZES[cmd - CMD_SIZE_BASE][0])
+            anchor = "size"
         elif CMD_FIELD_BASE <= cmd < CMD_FIELD_BASE + len(stripopts.FIELDS):
             pick = ("field", stripopts.FIELDS[cmd - CMD_FIELD_BASE][0])
+            anchor = "field"
         if pick is None:
-            return False
+            return None
         self._set_strip_option(*pick)
-        return True
+        return anchor
 
     def _set_strip_option(self, kind: str, value) -> None:
         """改长条外观 / 显示内容：存盘 + 立刻重画。
@@ -701,6 +756,13 @@ class PowerMonitorApp:
             if not msg.hWnd and msg.message == WM_TIMER:
                 self._tick()
                 continue
+            # 关机 / 注销：这是账本最后的机会，先落盘再让系统继续
+            # （消息照常派发下去，窗口过程会回 TRUE 表示同意关机）
+            if msg.message in (WM_QUERYENDSESSION, WM_ENDSESSION):
+                try:
+                    self.meter.save_now()
+                except Exception:  # noqa: BLE001
+                    pass
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -813,6 +875,10 @@ def self_test() -> int:
         average_w = 118.0
         today_wh = 1240.0
         gpu_limits = [320.0]
+        # 累计类字段（长条的「本月 / 累计 / 累计电费」用得到）
+        month_wh = 12300.0
+        total_wh = 156700.0
+        total_cost = 81.9
 
     class _ProbeCfg:
         cpu_ppt = 142.0
@@ -1055,6 +1121,106 @@ def self_test() -> int:
                 dialog.destroy()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---- 账本：存哪儿、跨天怎么算、旧字段怎么折算 ----
+    # 这一类故障的共性是「用户觉得记录丢了」，而且往往发生在升级之后 ——
+    # 所以下面这些检查里，磁盘位置是最关键的一条。
+    from . import meter as meter_mod
+
+    check("账本放在固定的用户数据目录（不跟 exe 走）",
+          config_mod.DATA_DIR.name == "PowerMonitor"
+          and config_mod.DATA_DIR != config_mod.app_dir(),
+          str(config_mod.DATA_DIR))
+
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    today = time.strftime("%Y-%m-%d")
+    real_state = meter_mod.STATE_PATH
+    try:
+        meter_mod.STATE_PATH = tmp / "state.json"
+        meter_mod.STATE_PATH.write_text(
+            json.dumps({
+                "total_wh": 3605.658,
+                "today_date": yesterday,
+                "today_wh": 2592.25,
+                "today_cost": 1.1112,
+                "saved_at": time.time(),
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        ledger = meter_mod.EnergyMeter(config_mod.Config())
+        check("旧版的单日数字折进了每日账本",
+              abs(ledger._days.get(yesterday, {}).get("wh", 0) - 2592.25) < 1e-6,
+              str(sorted(ledger._days)))
+        snap2 = ledger.snapshot()
+        expected_month = 2592.25 if yesterday[:7] == today[:7] else 0.0
+        check("本月电量 = 当月各天之和",
+              abs(snap2.month_wh - expected_month) < 1e-6,
+              f"{snap2.month_wh:.1f} Wh / {snap2.month_days} 天")
+        check("累计电量沿用旧账", abs(snap2.total_wh - 3605.658) < 1e-6,
+              f"{snap2.total_wh:.1f} Wh")
+        check("旧账缺 total_cost 时按每日账本补齐",
+              abs(snap2.total_cost - 1.1112) < 1e-6,
+              f"¥{snap2.total_cost:.2f}")
+        ledger.save_now()
+        saved = json.loads(meter_mod.STATE_PATH.read_text(encoding="utf-8"))
+        check("落盘能读回每日账本", isinstance(saved.get("days"), dict),
+              str(list(saved.get("days", {}))))
+        check("落盘带 total_cost", "total_cost" in saved,
+              str(saved.get("total_cost")))
+        check(f"每日账本保留 {meter_mod.HISTORY_DAYS} 天上限",
+              meter_mod.HISTORY_DAYS >= 365, str(meter_mod.HISTORY_DAYS))
+        check("落盘间隔缩到 15 秒内（少丢数据）",
+              0 < meter_mod.PERSIST_INTERVAL <= 15.0,
+              f"{meter_mod.PERSIST_INTERVAL}s")
+    finally:
+        meter_mod.STATE_PATH = real_state
+
+    # ---- 长条的新字段（本月 / 累计 / 累计电费） ----
+    extra_fields = {
+        key: stripopts.field_value(key, _ProbeSnap(), _ProbeCfg())
+        for key in ("month", "total", "total_cost")
+    }
+    check("累计类长条字段都算得出文本",
+          all(value is not None for value in extra_fields.values()),
+          str(extra_fields))
+
+    # ---- 托盘菜单：选项类子菜单点完要能「继续弹」 ----
+    # 菜单选中一项就必然关闭（系统行为），所以靠「重建同一级子菜单」来模拟
+    # 不关闭。这里保证「命令号 → 锚点」的映射完整，否则会静默退化成老行为。
+    # 用子类当探针：菜单那几个方法就是 PowerMonitorApp 上的，直接继承最省事，
+    # 只把 __init__ 换掉 —— 不建窗口、不起采样线程，也就不会抢托盘图标。
+    class _MenuProbe(PowerMonitorApp):
+        def __init__(self) -> None:
+            self.cfg = config_mod.Config()
+
+        def _set_strip_option(self, kind, value) -> None:
+            pass
+
+    found = {}
+    for base, count, anchor in (
+        (CMD_THEME_BASE, len(stripopts.THEMES), "theme"),
+        (CMD_FONT_BASE, len(stripopts.FONT_SCALES), "font"),
+        (CMD_SIZE_BASE, len(stripopts.SIZES), "size"),
+        (CMD_FIELD_BASE, len(stripopts.FIELDS), "field"),
+    ):
+        got = {
+            PowerMonitorApp._apply_strip_option(_MenuProbe(), base + i)
+            for i in range(count)
+        }
+        found[anchor] = got == {anchor}
+    check("每一档都能反查出它属于哪级子菜单", all(found.values()), str(found))
+    check("普通命令不会被当成选项（锚点为 None）",
+          PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_RESET) is None)
+    built = [
+        PowerMonitorApp._build_menu(_MenuProbe(), anchor)
+        for anchor in PowerMonitorApp.STRIP_MENUS
+    ]
+    check("每级子菜单都能单独建出来（继续弹的前提）",
+          all(bool(handle) for handle in built),
+          str([bool(handle) for handle in built]))
+    for handle in built:
+        if handle:
+            user32.DestroyMenu(handle)
 
     lines.append("")
     lines.append(f"通过 {counts['ok']} 项，失败 {counts['bad']} 项")

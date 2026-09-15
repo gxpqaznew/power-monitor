@@ -1,11 +1,14 @@
 """配置与路径。
 
-配置写在程序目录的 ``config.json``，首次运行自动生成默认值。
+配置与账本写在**固定的用户数据目录** ``%LOCALAPPDATA%\\PowerMonitor\\``，
+首次运行自动生成默认值；从旧版（配置放在 exe 同目录）升级时会自动接手。
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -18,8 +21,156 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-CONFIG_PATH = app_dir() / "config.json"
-STATE_PATH = app_dir() / "state.json"
+def user_data_dir() -> Path:
+    """用户数据目录 —— 位置固定，**与 exe 所在目录无关**。
+
+    为什么不能放 exe 同目录（旧版就是这么干的）：账本 ``state.json`` 一旦跟着
+    exe 走，用户从「绿色版目录」换成「安装版」、或者重装到别的路径之后，新目录
+    里没有 state.json，在他眼里就是「更新一次，历史全没了」。配置同理。
+    所以账本和配置都落到一个固定的地方。
+    """
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    directory = Path(base) / "PowerMonitor"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return app_dir()          # 实在建不出来就退回老行为，不能让程序起不来
+    return directory
+
+
+DATA_DIR = user_data_dir()
+CONFIG_PATH = DATA_DIR / "config.json"
+STATE_PATH = DATA_DIR / "state.json"
+
+
+def _candidate_dirs() -> list[Path]:
+    """旧版可能把文件放在哪儿（按可能性排序，去重、且排除当前数据目录）。"""
+    out: list[Path] = []
+    for directory in (
+        app_dir(),
+        app_dir() / "dist",
+        app_dir().parent / "dist",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "PowerMonitor",
+        Path.cwd(),
+    ):
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if resolved == DATA_DIR.resolve():
+            continue
+        if resolved not in out and resolved.is_dir():
+            out.append(resolved)
+    return out
+
+
+def _state_score(path: Path) -> tuple[float, float]:
+    """账本的「分量」：(累计电量, 最后保存时间)。取最大的那一份接手。
+
+    ⚠️ 顺序不能反。**累计电量 `total_wh` 是单调递增的**（程序里没有任何入口
+    会把它清零），所以几份账本里累计值最大的那份，就是见过最多历史的那份。
+
+    踩过的坑：一开始按「时间最新」挑，结果挑中了**正在运行的那个实例刚写的
+    小文件** —— 它启动才十几分钟、累计只有 220 Wh，比被冷落的那份 3605 Wh
+    少了 3.4 度电。时间戳新 ≠ 账本全：刚重启的程序永远写出一个「很新但很空」
+    的文件，正好会把最全的那份比下去。
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return (0.0, 0.0)
+
+    def number(key: str) -> float:
+        try:
+            return float(raw.get(key, 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    saved = number("saved_at")
+    if not saved:
+        try:
+            saved = path.stat().st_mtime
+        except OSError:
+            saved = 0.0
+    return (number("total_wh"), saved)
+
+
+def _backup(path: Path, reason: str) -> None:
+    """把没被选中的那份账本另存一份，绝不原地丢掉。
+
+    接手账本是个「可能有损」的动作（几份文件里只能选一份），万一挑错了，
+    原文件还在就能救回来。备份只做一次，不覆盖已有的。
+    """
+    target = DATA_DIR / f"state.json.bak-{reason}"
+    if target.exists():
+        return
+    _copy(path, target)
+
+
+def migrate_user_data() -> list[str]:
+    """把旧位置（exe 同目录 / dist / 安装目录）的配置与账本接手到数据目录。
+
+    只在新位置**还没有**该文件时才搬，绝不覆盖 —— 升级不能把用户刚记的账覆盖掉。
+    返回搬了哪些，方便日志与自检核对。
+    """
+    moved: list[str] = []
+
+    target = DATA_DIR / "config.json"
+    if not target.exists():
+        best: Path | None = None
+        for directory in _candidate_dirs():
+            candidate = directory / "config.json"
+            if candidate.is_file():
+                if best is None or candidate.stat().st_mtime > best.stat().st_mtime:
+                    best = candidate
+        if best is not None and _copy(best, target):
+            moved.append(f"{best.parent.name}/config.json")
+
+    target = DATA_DIR / "state.json"
+    if not target.exists():
+        found: list[Path] = []
+        for directory in _candidate_dirs():
+            candidate = directory / "state.json"
+            if candidate.is_file() and _state_score(candidate) > (0.0, 0.0):
+                found.append(candidate)
+        if found:
+            best = max(found, key=_state_score)
+            for other in found:
+                if other != best:
+                    _backup(other, other.parent.name)   # 没被选中的留个底
+            if _copy(best, target):
+                moved.append(f"{best.parent.name}/state.json")
+
+    return moved
+
+
+def _copy(src: Path, dst: Path) -> bool:
+    try:
+        shutil.copyfile(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def atomic_write_text(path: Path, text: str) -> bool:
+    """先写临时文件、再 ``os.replace`` 换上去。
+
+    账本每隔十几秒就落一次盘，要是正好在写一半的时候断电 / 被任务管理器强杀，
+    留下的是个截断的 JSON —— 下次启动整本账都读不出来，比丢几十秒严重得多。
+    ``os.replace`` 在同一分区上是原子的：读到的要么是旧的整份，要么是新的整份。
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
 
 
 @dataclass
@@ -107,6 +258,8 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
+        # 先看看旧位置有没有配置/账本要接手（只搬一次，之后就直接读数据目录）
+        migrate_user_data()
         if CONFIG_PATH.exists():
             try:
                 raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -147,10 +300,7 @@ class Config:
             self.tariff_note = ""
 
     def save(self) -> None:
-        try:
-            CONFIG_PATH.write_text(
-                json.dumps(asdict(self), indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+        atomic_write_text(
+            CONFIG_PATH,
+            json.dumps(asdict(self), indent=2, ensure_ascii=False),
+        )

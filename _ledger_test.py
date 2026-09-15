@@ -171,6 +171,22 @@ def main() -> int:
         (config_mod.STATE_PATH, config_mod.STATE_BACKUP_PATH,
          config_mod.DATA_DIR) = saved_paths
 
+    # ---- 7. 退出必须立刻落盘，不能等 15 秒的定时器 ----
+    # 用户的原话是「每次退出之前一定要能保存」。正常退出 / 注销 / 关机 / atexit
+    # 都走 stop() 或 save_now()，它们必须无条件写盘 —— 哪怕上一秒刚写过。
+    path7 = with_state(None)
+    m7 = meter_mod.EnergyMeter(cfg)
+    with m7._lock:
+        m7._total_wh = 999.5
+    m7._last_persist = time.monotonic()      # 假装刚存过，定时器这一轮不触发
+    m7.stop()
+    check("退出时强制落盘（不等定时器）",
+          abs(read_back(path7)["total_wh"] - 999.5) < 1e-6,
+          f"total_wh={read_back(path7).get('total_wh')}")
+    m7.stop()                                # 退出路径 + atexit 兜底会各调一次
+    check("stop() 幂等（双路径不会互相踩）",
+          abs(read_back(path7)["total_wh"] - 999.5) < 1e-6)
+
     print(f"\n通过 {PASS} 项，失败 {FAIL} 项")
     return 1 if FAIL else 0
 

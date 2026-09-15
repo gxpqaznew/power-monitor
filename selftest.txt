@@ -1,4 +1,4 @@
-开机能耗统计 v1.0.5 自检
+开机能耗统计 v1.0.7 自检
 frozen=False  python=3.13.14
 exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
@@ -43,9 +43,13 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 落盘带 total_cost  (1.1112)
 [PASS] 每日账本保留 400 天上限  (400)
 [PASS] 落盘间隔缩到 15 秒内（少丢数据）  (15.0s)
+[PASS] 账本留有『上一代』副本（state.json.prev）  (state.json.prev)
+[PASS] state.json 被清掉时自动接手上一代副本  (['dist/config.json', 'state.json.prev'])
 [PASS] 累计类长条字段都算得出文本  ({'month': ('本月', '12.3', 'kWh'), 'total': ('累计', '156.70', 'kWh'), 'total_cost': ('累计电费', '¥81.90', '')})
 [PASS] 每一档都能反查出它属于哪级子菜单  ({'theme': True, 'font': True, 'size': True, 'field': True})
 [PASS] 普通命令不会被当成选项（锚点为 None）
 [PASS] 每级子菜单都能单独建出来（继续弹的前提）  ([True, True, True, True])
+[PASS] 整张根菜单也能为「继续弹」重建（顶层勾选式开关用）
+[PASS] 顶层三个勾选式开关都登记成「点完不关」  (3)
 
-通过 45 项，失败 0 项
+通过 49 项，失败 0 项

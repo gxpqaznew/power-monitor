@@ -204,6 +204,11 @@ class PowerMonitorApp:
     #   · _build_menu(anchor) 只返回这一级（点完接着弹用，见 tray.TrayIcon._popup）
     #   · _apply_strip_option(cmd) 返回该命令所属的锚点
     STRIP_MENUS = ("theme", "font", "size", "field")
+    # 「继续弹」的另一个锚点：整张根菜单。给顶层那几个勾选式开关用 ——
+    # 用户点一个勾、还想点下一个时，菜单不该关掉。
+    ROOT_MENU = "root"
+    # 顶层勾选式开关：点完菜单留在原地（普通动作命令仍然照常关闭）。
+    PERSIST_COMMANDS = (CMD_TOGGLE_AUTOSTART, CMD_PIN_TASKBAR, CMD_TOGGLE_STRIP)
 
     def _menu_theme(self) -> "MenuBuilder":
         menu = MenuBuilder.submenu()
@@ -243,6 +248,9 @@ class PowerMonitorApp:
         ``anchor`` 命中 ``STRIP_MENUS`` 时**只返回那一级子菜单**：用户勾完一个
         显示字段后，在同一位置立刻再弹出同一级，可以连着勾 —— 否则每勾一项
         菜单就关掉，得回托盘重新点右键（用户投诉的就是这个）。
+
+        命中 ``ROOT_MENU`` 或 ``None`` 时建的是整张菜单（前者用于顶层勾选式
+        开关点完继续弹，后者是常规右键）。
         """
         if anchor in self.STRIP_MENUS:
             return getattr(self, f"_menu_{anchor}")().handle
@@ -318,8 +326,10 @@ class PowerMonitorApp:
     def _on_command(self, cmd: int) -> str | None:
         """处理菜单命令。
 
-        返回值是**下一个要继续弹出的子菜单锚点**（``None`` = 菜单照常关闭）。
-        托盘那边拿它实现「勾完一项菜单不消失」。
+        返回值是**下一个要继续弹出的菜单锚点**（``None`` = 菜单照常关闭）：
+        子菜单类命令返回 ``"theme"`` / ``"font"`` / ``"size"`` / ``"field"``，
+        顶层勾选式开关返回 ``"root"``（整张根菜单）。托盘那边拿它实现
+        「勾完一项菜单不消失」。
         """
         try:
             # 长条外观 / 内容类命令号落在各自的区间里，先让它们吃掉
@@ -330,12 +340,15 @@ class PowerMonitorApp:
                 self._toggle_panel()
             elif cmd in _MODE_BY_CMD:
                 self._set_mode(_MODE_BY_CMD[cmd])
-            elif cmd == CMD_TOGGLE_AUTOSTART:
-                self._toggle_autostart()
-            elif cmd == CMD_PIN_TASKBAR:
-                self._toggle_pin()
-            elif cmd == CMD_TOGGLE_STRIP:
-                self._toggle_strip()
+            elif cmd in self.PERSIST_COMMANDS:
+                # 勾选式开关：改完把整张菜单原地再弹一次，方便连着勾好几项。
+                if cmd == CMD_TOGGLE_AUTOSTART:
+                    self._toggle_autostart()
+                elif cmd == CMD_PIN_TASKBAR:
+                    self._toggle_pin()
+                else:
+                    self._toggle_strip()
+                return self.ROOT_MENU
             elif cmd == CMD_FEE_SETTINGS:
                 self._open_fee_settings()
             elif cmd == CMD_OPEN_CONFIG:
@@ -1219,9 +1232,27 @@ def self_test() -> int:
     # 不关闭。这里保证「命令号 → 锚点」的映射完整，否则会静默退化成老行为。
     # 用子类当探针：菜单那几个方法就是 PowerMonitorApp 上的，直接继承最省事，
     # 只把 __init__ 换掉 —— 不建窗口、不起采样线程，也就不会抢托盘图标。
+    class _MenuSnap:
+        power_on_seconds = 7200.0
+        session_wh = 428.3
+        session_cost = 1.284
+        today_wh = 1240.0
+        today_cost = 0.65
+        month_wh = 12300.0
+        month_cost = 6.4
+        total_wh = 156700.0
+        total_cost = 81.9
+        total_days = 12
+        total_sessions = 5
+
+    class _MenuMeter:
+        def snapshot(self):
+            return _MenuSnap()
+
     class _MenuProbe(PowerMonitorApp):
         def __init__(self) -> None:
             self.cfg = config_mod.Config()
+            self.meter = _MenuMeter()
 
         def _set_strip_option(self, kind, value) -> None:
             pass
@@ -1248,7 +1279,14 @@ def self_test() -> int:
     check("每级子菜单都能单独建出来（继续弹的前提）",
           all(bool(handle) for handle in built),
           str([bool(handle) for handle in built]))
-    for handle in built:
+    root = PowerMonitorApp._build_menu(_MenuProbe(), PowerMonitorApp.ROOT_MENU)
+    check("整张根菜单也能为「继续弹」重建（顶层勾选式开关用）",
+          bool(root) and PowerMonitorApp.ROOT_MENU not in PowerMonitorApp.STRIP_MENUS)
+    check("顶层三个勾选式开关都登记成「点完不关」",
+          set(PowerMonitorApp.PERSIST_COMMANDS)
+          == {CMD_TOGGLE_AUTOSTART, CMD_PIN_TASKBAR, CMD_TOGGLE_STRIP},
+          str(len(PowerMonitorApp.PERSIST_COMMANDS)))
+    for handle in built + [root]:
         if handle:
             user32.DestroyMenu(handle)
 

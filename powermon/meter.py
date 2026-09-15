@@ -24,7 +24,13 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .config import STATE_PATH, Config, atomic_write_text, migrate_user_data
+from .config import (
+    STATE_PATH,
+    Config,
+    atomic_write_text,
+    migrate_user_data,
+    snapshot_state,
+)
 from .poweron import session_start
 from .sensors import Reading, SensorHub
 from .tariffs import parse_hours
@@ -254,6 +260,12 @@ class EnergyMeter:
 
         state: dict = {}
         if STATE_PATH.exists():
+            # 开始往这本账上写之前先留一份「上一代」：任何把 state.json 清掉或写坏
+            # 的意外，都能靠 state.json.prev 原样救回来（下次启动会自动接手它）。
+            try:
+                snapshot_state()
+            except Exception:  # noqa: BLE001 - 备份失败不能挡住启动
+                pass
             try:
                 state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):

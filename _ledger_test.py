@@ -136,6 +136,41 @@ def main() -> int:
     check("留下的是最近的那些天", max(m5._days) == max(many),
           f"最新一天 = {max(m5._days)}")
 
+    # ---- 6. state.json 被清掉：必须从「上一代」副本自动接手 ----
+    # 冲着一个真实事故写的：v1.0.6 的安装脚本在收尾段删了用户数据目录里的
+    # state.json（它以为那是旧便携目录），3605 Wh 的账本当场归零。有了
+    # state.json.prev，这种「文件凭空消失」至少还能自己站起来。
+    from powermon import config as config_mod
+
+    saved_paths = (config_mod.STATE_PATH, config_mod.STATE_BACKUP_PATH,
+                   config_mod.DATA_DIR)
+    rec = Path(tempfile.mkdtemp(prefix="pm_recover_"))
+    try:
+        config_mod.DATA_DIR = rec
+        config_mod.STATE_PATH = rec / "state.json"
+        config_mod.STATE_BACKUP_PATH = rec / "state.json.prev"
+        config_mod.STATE_BACKUP_PATH.write_text(
+            json.dumps({
+                "total_wh": 3605.658,
+                "days": {today: [10.0, 0.008, 60.0]},
+                "saved_at": time.time(),
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        moved = config_mod.migrate_user_data()
+        check("state.json 被清掉时自动接手上一代副本",
+              config_mod.STATE_PATH.exists()
+              and abs(read_back(config_mod.STATE_PATH)["total_wh"] - 3605.658) < 1e-6,
+              str(moved))
+        meter_mod.STATE_PATH = config_mod.STATE_PATH
+        m6 = meter_mod.EnergyMeter(cfg)
+        check("接手后累计与每日账本都在",
+              abs(m6.snapshot().total_wh - 3605.658) < 1e-6 and today in m6._days,
+              f"total_wh={m6.snapshot().total_wh} days={sorted(m6._days)}")
+    finally:
+        (config_mod.STATE_PATH, config_mod.STATE_BACKUP_PATH,
+         config_mod.DATA_DIR) = saved_paths
+
     print(f"\n通过 {PASS} 项，失败 {FAIL} 项")
     return 1 if FAIL else 0
 

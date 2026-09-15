@@ -9,8 +9,11 @@
 ;    · per-user 安装（$LOCALAPPDATA\Programs\PowerMonitor）+ RequestExecutionLevel user
 ;      —— 全程不弹 UAC。程序要写的 HKCU\...\Run 与 HKCU\Control Panel\NotifyIconSettings
 ;         本来就是用户级设置，不需要管理员权限。
-;    · 安装时自动接手旧便携版（$LOCALAPPDATA\PowerMonitor）里的 config.json /
-;      state.json，设置与能耗账本不丢，随后清理旧目录。
+;    · $LOCALAPPDATA\PowerMonitor 是**用户数据目录**（v1.0.6 起配置与账本的固定
+;      位置），安装/卸载都不得删除它。老版本把 state.json / config.json 放在
+;      安装目录里，安装时把那份接进数据目录，设置与账本不丢。
+;      ⚠️ 这个目录以前同时是「旧便携版目录」，收尾步骤里原本有一段 Delete/RMDir
+;      清理它 —— 那正是把用户账本删掉的地方（v1.0.6 首次发布时踩过），已移除。
 ;    · 卸载时一并清掉自启项与托盘「常驻任务栏」登记，不留尾巴。
 ;
 ;  注意：本文件必须保存为 UTF-8 with BOM，否则 Unicode 模式下中文会编译成乱码。
@@ -26,7 +29,7 @@ Unicode true
 !define APP_NAME      "开机能耗统计"
 !define APP_EXE       "能耗统计.exe"
 !define APP_ID        "PowerMonitor"
-!define APP_VERSION   "1.0.6"
+!define APP_VERSION   "1.0.7"
 !define APP_PUBLISHER "本地构建"
 
 !define UNINST_EXE "卸载 ${APP_NAME}.exe"
@@ -98,18 +101,31 @@ Section "${APP_NAME} 主程序" SEC_MAIN
   Pop $0
   Sleep 600
 
-  ; 从旧的便携目录接手用户数据 —— 设置和账本都不丢
+  ; 安装目录里那份 config.json / state.json 是**旧版遗留**（v1.0.6 之前用户数据
+  ; 就放在安装目录）。规则很简单：
+  ;   · 数据目录还缺 → 把它接过去（升级不丢设置与账本）；
+  ;   · 数据目录已经有了 → 用数据目录那份，安装目录这份作废；
+  ;   · 两种情况搬完都把安装目录那份删掉 —— 留着一份又小又旧的账本，等哪天
+  ;     数据目录出事，自动接手就会挑到它，等于把历史换成一小截。
   ${If} $INSTDIR != "${LEGACY_DIR}"
-    ${IfNot} ${FileExists} "$INSTDIR\config.json"
-      ${If} ${FileExists} "${LEGACY_DIR}\config.json"
-        CopyFiles /SILENT "${LEGACY_DIR}\config.json" "$INSTDIR\config.json"
+    ${If} ${FileExists} "$INSTDIR\config.json"
+      ${IfNot} ${FileExists} "${LEGACY_DIR}\config.json"
+        CreateDirectory "${LEGACY_DIR}"
+        CopyFiles /SILENT "$INSTDIR\config.json" "${LEGACY_DIR}\config.json"
         DetailPrint "已接手原有设置：config.json"
       ${EndIf}
+      ${If} ${FileExists} "${LEGACY_DIR}\config.json"
+        Delete "$INSTDIR\config.json"
+      ${EndIf}
     ${EndIf}
-    ${IfNot} ${FileExists} "$INSTDIR\state.json"
-      ${If} ${FileExists} "${LEGACY_DIR}\state.json"
-        CopyFiles /SILENT "${LEGACY_DIR}\state.json" "$INSTDIR\state.json"
+    ${If} ${FileExists} "$INSTDIR\state.json"
+      ${IfNot} ${FileExists} "${LEGACY_DIR}\state.json"
+        CreateDirectory "${LEGACY_DIR}"
+        CopyFiles /SILENT "$INSTDIR\state.json" "${LEGACY_DIR}\state.json"
         DetailPrint "已接手原有账本：state.json"
+      ${EndIf}
+      ${If} ${FileExists} "${LEGACY_DIR}\state.json"
+        Delete "$INSTDIR\state.json"
       ${EndIf}
     ${EndIf}
   ${EndIf}
@@ -149,13 +165,12 @@ SectionEnd
 Section "-收尾" SEC_INFO
   SetShellVarContext current
 
-  ; 旧便携目录已经没用了，清理掉
-  ${If} $INSTDIR != "${LEGACY_DIR}"
-    Delete "${LEGACY_DIR}\${APP_EXE}"
-    Delete "${LEGACY_DIR}\config.json"
-    Delete "${LEGACY_DIR}\state.json"
-    RMDir "${LEGACY_DIR}"
-  ${EndIf}
+  ; ⚠️ 这里**不得**清理 ${LEGACY_DIR}（$LOCALAPPDATA\PowerMonitor）。
+  ; 那个目录在 v1.0.6 之后是用户数据目录，装的是用户的能耗账本 state.json
+  ; （几度电、几百天的历史）。v1.0.6 首次发布时这里还留着一段「旧便携目录
+  ; 清理」，`Delete "${LEGACY_DIR}\state.json"` 把刚攒下的 3605 Wh 账本直接
+  ; 删了，用户看到的现象就是「更新一次，记录全没了」—— 与 v1.0.6 想修的
+  ; 问题一模一样。卸载同样不删用户数据：升级、重装都不该让历史归零。
 
   ; 登记到「设置 → 应用 → 已安装的应用」
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayName"          "${APP_NAME}"

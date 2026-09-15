@@ -1175,6 +1175,36 @@ def self_test() -> int:
     finally:
         meter_mod.STATE_PATH = real_state
 
+    check("账本留有『上一代』副本（state.json.prev）",
+          (not config_mod.STATE_PATH.exists())
+          or config_mod.STATE_BACKUP_PATH.exists(),
+          config_mod.STATE_BACKUP_PATH.name)
+
+    # state.json 被清掉也要能自己站起来。这一条是冲着「安装程序多手删了账本」
+    # 那个真实事故写的：数据目录里还有上一代副本时，启动必须直接接手它，
+    # 而不是退回去翻 exe 同目录那份又小又旧的账。
+    recov = tmp / "recover"
+    recov.mkdir()
+    origin = (config_mod.STATE_PATH, config_mod.STATE_BACKUP_PATH, config_mod.DATA_DIR)
+    try:
+        config_mod.DATA_DIR = recov
+        config_mod.STATE_PATH = recov / "state.json"
+        config_mod.STATE_BACKUP_PATH = recov / "state.json.prev"
+        config_mod.STATE_BACKUP_PATH.write_text(
+            json.dumps({"total_wh": 4321.0, "saved_at": time.time()}),
+            encoding="utf-8",
+        )
+        moved = config_mod.migrate_user_data()
+        got_wh = 0.0
+        if config_mod.STATE_PATH.exists():
+            got_wh = float(json.loads(
+                config_mod.STATE_PATH.read_text(encoding="utf-8")).get("total_wh", 0))
+        check("state.json 被清掉时自动接手上一代副本",
+              abs(got_wh - 4321.0) < 1e-6, str(moved))
+    finally:
+        (config_mod.STATE_PATH, config_mod.STATE_BACKUP_PATH,
+         config_mod.DATA_DIR) = origin
+
     # ---- 长条的新字段（本月 / 累计 / 累计电费） ----
     extra_fields = {
         key: stripopts.field_value(key, _ProbeSnap(), _ProbeCfg())

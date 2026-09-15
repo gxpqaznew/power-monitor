@@ -41,6 +41,8 @@ def user_data_dir() -> Path:
 DATA_DIR = user_data_dir()
 CONFIG_PATH = DATA_DIR / "config.json"
 STATE_PATH = DATA_DIR / "state.json"
+# 账本的「上一代」副本，每次启动时刷新一次（见 snapshot_state）。
+STATE_BACKUP_PATH = DATA_DIR / "state.json.prev"
 
 
 def _candidate_dirs() -> list[Path]:
@@ -128,6 +130,14 @@ def migrate_user_data() -> list[str]:
 
     target = DATA_DIR / "state.json"
     if not target.exists():
+        # 数据目录自己的「上一代」副本优先于任何旧位置的文件 —— 它是同一血脉
+        # 里最近的一份，比 exe 同目录 / 安装目录里那些更忠实。走这条路恢复时
+        # 用户看到的是「记录还在」，而不是「又从头开始了」。
+        if STATE_BACKUP_PATH.is_file() and _state_score(STATE_BACKUP_PATH) > (0.0, 0.0):
+            if _copy(STATE_BACKUP_PATH, target):
+                moved.append("state.json.prev")
+                return moved
+
         found: list[Path] = []
         for directory in _candidate_dirs():
             candidate = directory / "state.json"
@@ -150,6 +160,20 @@ def _copy(src: Path, dst: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def snapshot_state() -> bool:
+    """把当前账本另存一份 ``state.json.prev``（覆盖式，只留上一代）。
+
+    每次启动读账本之前刷一次 —— 这样任何「把 state.json 清掉 / 写坏」的意外
+    （安装程序多手、磁盘故障、用户手改坏文件）都还有上一代完整的账本可救。
+    账本只有几 KB，这点开销可以忽略；换来的是一条最后防线。
+
+    注意是**覆盖式**：只保留上一代，不做无限堆叠，免得数据目录长出一堆快照。
+    """
+    if not STATE_PATH.exists():
+        return False
+    return _copy(STATE_PATH, STATE_BACKUP_PATH)
 
 
 def atomic_write_text(path: Path, text: str) -> bool:

@@ -71,15 +71,20 @@ def main() -> int:
                   f"{'最宽一行':>9} {'总高':>6}")
             for fs in stripopts.FONT_SCALE_VALUES:
                 fonts = strip._fonts_for(SCALE, fs)
-                rows = strip._pack(dc, sections, content, gap_label, gap_unit,
-                                   div_margin, fonts)
-                w = max(strip._row_width(dc, r, gap_label, gap_unit,
-                                         div_margin, fonts) for r in rows)
-                row_h = _ROW_H * SCALE * fs
-                max_rows = max(1, min(3, int(BUDGET // row_h)))
-                flag = "  <- 装得下" if len(rows) <= max_rows else ""
-                print(f"{fs:>6.2f} {row_h:>6.1f} {max_rows:>8} {len(rows):>8} "
-                      f"{w:>9} {row_h * len(rows):>6.0f}{flag}")
+                for rows_wanted in (1, 2, 3):
+                    rows = strip._split(sections, rows_wanted)
+                    grid = strip._grid(dc, rows, fonts, gap_label, gap_unit,
+                                       div_margin)
+                    w = grid["width"]
+                    row_h = _ROW_H * SCALE * fs
+                    max_rows = max(1, min(3, int(BUDGET // row_h)))
+                    fits = w <= content and len(rows) <= max_rows
+                    if rows_wanted > 1 and not fits and rows_wanted < 3:
+                        continue
+                    flag = "  <- 装得下" if fits else ""
+                    print(f"{fs:>6.2f} {row_h:>6.1f} {max_rows:>8} "
+                          f"{len(rows):>8} {w:>9} {row_h * len(rows):>6.0f}"
+                          f"  {len(rows[0])}列{flag}")
             print()
 
         # ---- 真·走 _plan，看最终选了什么 ----

@@ -39,14 +39,19 @@ from .tray import (
     CMD_MODE_SESSION,
     CMD_OPEN_CONFIG,
     CMD_PIN_TASKBAR,
+    CMD_POS_RESET,
     CMD_QUIT,
     CMD_RESET,
     CMD_SIZE_BASE,
     CMD_STATS,
     CMD_THEME_BASE,
     CMD_TOGGLE_AUTOSTART,
+    CMD_TOGGLE_GRIP,
     CMD_TOGGLE_PANEL,
     CMD_TOGGLE_STRIP,
+    CMD_VIEW_DAY_BASE,
+    CMD_VIEW_SESSION_BASE,
+    MENU_RECENT,
     MenuBuilder,
     TrayIcon,
 )
@@ -140,6 +145,18 @@ def _dbg(msg: str) -> None:
     debug.log("app", msg)
 
 
+def _kwh(wh: float) -> str:
+    """菜单里那种一行放得下的电量写法：980 Wh / 3.41 kWh。
+
+    菜单项没有第二行可用，所以口径和统计窗口的 ``_energy()`` 保持一致，
+    只是不写「Wh」的十进小数尾巴（0.98 kWh 比 980.0 Wh 读得快）。
+    """
+    if abs(wh) >= 1000.0:
+        return f"{wh / 1000.0:.2f} kWh"
+    return f"{wh:.0f} Wh"
+
+
+
 def _exe_path() -> str:
     """当前程序的「身份」路径——托盘条目就是按它登记的。"""
     if getattr(sys, "frozen", False):
@@ -208,7 +225,7 @@ class PowerMonitorApp:
     # 四个「选项类」子菜单的锚点。两件事共用同一套名字：
     #   · _build_menu(anchor) 只返回这一级（点完接着弹用，见 tray.TrayIcon._popup）
     #   · _apply_strip_option(cmd) 返回该命令所属的锚点
-    STRIP_MENUS = ("theme", "font", "size", "field")
+    STRIP_MENUS = ("theme", "font", "size", "field", "position")
     # 「继续弹」的另一个锚点：整张根菜单。给顶层那几个勾选式开关用 ——
     # 用户点一个勾、还想点下一个时，菜单不该关掉。
     ROOT_MENU = "root"
@@ -246,6 +263,82 @@ class PowerMonitorApp:
             menu.item(CMD_FIELD_BASE + i, label, is_on,
                       enabled=not (is_on and len(shown) <= 1))
         return menu
+
+    def _menu_position(self) -> "MenuBuilder":
+        """长条位置：拖动把手开关 + 位置复位。
+
+        长条本体是穿透点击的（不能吃掉任务栏右键菜单），所以拖动只能挂在两端
+        那两块 15px 的「把手」上 —— 关掉把手就等于关掉拖动，这里给个开关。
+        拖歪了不想手动拖回去，就用「位置复位」。
+        """
+        menu = MenuBuilder.submenu()
+        menu.item(CMD_TOGGLE_GRIP, "拖动把手（两端的小圆点）",
+                  stripopts.grip_enabled(self.cfg))
+        menu.item(CMD_POS_RESET, "位置复位（回到开始按钮左边）")
+        return menu
+
+    # ---- 「查看某一天 / 某一次开机」：把最近这些条目直接摆到菜单上 ----
+
+    def _menu_view_day(self) -> "MenuBuilder":
+        """最近若干天，一天一项，带上那天的电量与电费。
+
+        用户要的就是这个：不用先打开窗口再自己找，菜单里点一下就是那天。
+        """
+        menu = MenuBuilder.submenu()
+        rows = self._recent_rows("day")
+        if not rows:
+            menu.item(CMD_VIEW_DAY_BASE, "（还没有记录）", False, enabled=False)
+            return menu
+        cur = self.cfg.currency
+        for i, row in enumerate(rows):
+            label = (f"{row.get('when', '')}    {_kwh(row.get('wh', 0.0))}"
+                     f" · {cur}{row.get('cost', 0.0):.2f}")
+            menu.item(CMD_VIEW_DAY_BASE + i, label)
+        return menu
+
+    def _menu_view_session(self) -> "MenuBuilder":
+        """最近若干次开机，一次一项。当前这一次单独标出来。
+
+        键是开机时刻，所以「每次开机」确实是每一次，不是只当前这次。
+        """
+        menu = MenuBuilder.submenu()
+        rows = self._recent_rows("session")
+        if not rows:
+            menu.item(CMD_VIEW_SESSION_BASE, "（还没有记录）", False, enabled=False)
+            return menu
+        cur = self.cfg.currency
+        boot_now = self.meter.snapshot().power_on_ts
+        for i, row in enumerate(rows):
+            mark = ("（本次）"
+                    if abs(float(row.get("boot", 0)) - boot_now) < 30 else "")
+            label = (f"{row.get('when', '')}{mark}    {_kwh(row.get('wh', 0.0))}"
+                     f" · {cur}{row.get('cost', 0.0):.2f}")
+            menu.item(CMD_VIEW_SESSION_BASE + i, label)
+        return menu
+
+    def _recent_rows(self, kind: str) -> list[dict]:
+        try:
+            rows = self.meter.stats_rows(kind, MENU_RECENT)
+        except Exception:  # noqa: BLE001 - 菜单构建绝不能因为统计失败而炸
+            return []
+        return list(rows)[:MENU_RECENT]
+
+    def _view_entry(self, cmd: int) -> bool:
+        """「查看某一天 / 某一次开机」的命令号 → 打开统计窗口并定位到那一条。"""
+        if CMD_VIEW_DAY_BASE <= cmd < CMD_VIEW_DAY_BASE + MENU_RECENT:
+            rows = self._recent_rows("day")
+            anchor, kind = CMD_VIEW_DAY_BASE, "day"
+        elif (CMD_VIEW_SESSION_BASE <= cmd
+              < CMD_VIEW_SESSION_BASE + MENU_RECENT):
+            rows = self._recent_rows("session")
+            anchor, kind = CMD_VIEW_SESSION_BASE, "session"
+        else:
+            return False
+        index = cmd - anchor
+        if index >= len(rows):
+            return True          # 菜单是上一次拼的，数据变了 —— 当无事发生
+        self.stats.show(kind, str(rows[index].get("key", "")))
+        return True
 
     def _build_menu(self, anchor: str | None = None):
         """构建托盘菜单。
@@ -316,9 +409,15 @@ class PowerMonitorApp:
         menu.attach("长条字号", self._menu_font())
         menu.attach("长条大小", self._menu_size())
         menu.attach("长条显示内容", self._menu_field())
+        menu.attach("长条位置", self._menu_position())
         menu.separator()
-        # 统计放在电价设置上面：用户是「看用量」来的，翻账本比改电价常用得多
-        menu.item(CMD_STATS, "用量统计…")
+        # 统计放在电价设置上面：用户是「看用量」来的，翻账本比改电价常用得多。
+        # 「查看某一天 / 某次开机」是二级子菜单，把最近十条直接摆出来 ——
+        # 用户说「菜单里可以自主选择某一天去看」，指的就是这个：点一下就是那天，
+        # 不用先打开窗口再自己滚着找。
+        menu.attach("查看某一天", self._menu_view_day())
+        menu.attach("查看某次开机", self._menu_view_session())
+        menu.item(CMD_STATS, "用量统计（全部明细）…")
         menu.item(CMD_FEE_SETTINGS, "电价设置…")
         menu.item(CMD_OPEN_CONFIG, "打开配置文件")
         menu.separator()
@@ -343,6 +442,15 @@ class PowerMonitorApp:
             anchor = self._apply_strip_option(cmd)
             if anchor is not None:
                 return anchor
+            # 「查看某一天 / 某一次开机」也是区间命令，同样先吃掉
+            if self._view_entry(cmd):
+                return None
+            if cmd == CMD_TOGGLE_GRIP:
+                self._toggle_grip()
+                return "position"
+            if cmd == CMD_POS_RESET:
+                self._reset_strip_position()
+                return None
             if cmd == CMD_TOGGLE_PANEL:
                 self._toggle_panel()
             elif cmd in _MODE_BY_CMD:
@@ -426,6 +534,18 @@ class PowerMonitorApp:
         self.cfg.save()
         self.strip.invalidate()
         self._ensure_strip()
+
+    def _toggle_grip(self) -> None:
+        """开关长条两端的拖动把手（关掉就拖不动了）。"""
+        target = not stripopts.grip_enabled(self.cfg)
+        self.cfg.strip_grip = target
+        self.cfg.save()
+        self.strip.set_grip_enabled(target)
+
+    def _reset_strip_position(self) -> None:
+        """把长条拖回默认位置（开始按钮左边）。"""
+        self.strip.reset_offset()
+        self.strip.tick(self.meter.snapshot())
 
     # ------------------------------------------------------------- 消息
 
@@ -1034,6 +1154,24 @@ def self_test() -> int:
           and bad.strip_fields == list(stripopts.DEFAULT_FIELDS),
           f"{bad.strip_theme}/{bad.strip_size}/{bad.strip_font_scale}/{bad.strip_fields}")
 
+    # ---- 拖动（长条位置）：偏移的合法性与折行表格 ----
+    # 拖动量是用户拖出来的，手改 config.json 能写成任何东西；这里保证离谱的值
+    # 会被夹住，而不是让长条飞到屏幕外面（用户会以为「长条不见了」）。
+    check("不拖时偏移就是 0（默认落点）",
+          abs(stripopts.offset_x(config_mod.Config())) < 1e-9)
+    check("把手默认是开的（没有把手就拖不动）",
+          stripopts.grip_enabled(config_mod.Config()) is True)
+    wild = _variant(strip_offset_x=1e9, strip_grip="yes")
+    check("手改出来的拖动偏移会被夹住、把手开关会转成布尔",
+          stripopts.sanitize(wild) is True
+          and abs(wild.strip_offset_x - stripopts.OFFSET_LIMIT) < 1e-6
+          and wild.strip_grip is True,
+          f"{wild.strip_offset_x}/{wild.strip_grip}")
+    junk = _variant(strip_offset_x="左边一点")
+    check("偏移写成非数字时退回 0（不能让长条算不出位置）",
+          stripopts.sanitize(junk) is True and junk.strip_offset_x == 0.0,
+          repr(junk.strip_offset_x))
+
     screen_dc = user32.GetDC(None)
     theme_dc = gdi32.CreateCompatibleDC(screen_dc)
     try:
@@ -1136,6 +1274,24 @@ def self_test() -> int:
                   f"密度档 {plan['density']}，字号 {plan['font_scale']}")
             check("字段多的时候确实折了行", len(plan["rows"]) >= 2,
                   f"{len(plan['rows'])} 行")
+            # 折行必须摊成「行 × 列」的表格：行数 = 要求的行数、每行尽量一样多，
+            # 并且**每列宽度取该列所有格子的最大值** —— 两条加起来才叫「两排对齐」
+            # （列起点和分隔线的 x 都只由列决定，和行号无关）。
+            # 真机上由 _stripfields_test.py 的 DrawSpy 按绘制调用的 x 再验一遍。
+            check("折行摊成表格：每行格数只差一个（第一行多一格）",
+                  len(plan["rows"]) >= 2
+                  and max(len(r) for r in plan["rows"])
+                  - min(len(r) for r in plan["rows"]) <= 1
+                  and len(plan["rows"][0]) >= len(plan["rows"][-1]),
+                  str([len(r) for r in plan["rows"]]))
+            grid = plan["grid"]
+            ok_grid = all(
+                grid["col_w"][j] + 1e-6
+                >= grid["label_w"][j] + plan["gap_label"] + grid["rest_w"][j]
+                for j in range(grid["cols"])
+            )
+            check("每列宽度 ≥ 该列任何一个格子所需（不会把字截掉）", ok_grid,
+                  f"{grid['cols']} 列 / 列宽 {[round(v) for v in grid['col_w']]}")
         finally:
             full_strip.destroy()
     finally:
@@ -1295,15 +1451,27 @@ def self_test() -> int:
               f"{snap2.month_wh:.1f} Wh / {snap2.month_days} 天")
         check("累计电量沿用旧账", abs(snap2.total_wh - 3605.658) < 1e-6,
               f"{snap2.total_wh:.1f} Wh")
-        check("旧账缺 total_cost 时按每日账本补齐",
-              abs(snap2.total_cost - 1.1112) < 1e-6,
-              f"¥{snap2.total_cost:.2f}")
+        # v2 起账本只记电量、电费是按峰谷电价现算的**视图**，所以旧账里那笔
+        # total_cost 不再继承（它的口径可能是旧电价，直接继承就会出现「累计电费
+        # 比本次电费还低」那种倒挂）。这里验的是「电费仍然算得出来」+「单调」。
+        price = config_mod.Config().price_flat or 0.5
+        check("旧账没有电费字段也能算出累计电费（按电量现算）",
+              abs(snap2.total_cost - 3605.658 / 1000.0 * price) < 0.05,
+              f"¥{snap2.total_cost:.2f}（按 ¥{price}/kWh 估）")
+        check("电费单调：累计 ≥ 本次 ≥ 今日",
+              snap2.total_cost + 1e-6 >= snap2.session_cost
+              and snap2.session_cost + 1e-6 >= snap2.today_cost,
+              f"累计 ¥{snap2.total_cost:.2f} ≥ 本次 ¥{snap2.session_cost:.2f} "
+              f"≥ 今日 ¥{snap2.today_cost:.2f}")
         ledger.save_now()
         saved = json.loads(meter_mod.STATE_PATH.read_text(encoding="utf-8"))
         check("落盘能读回每日账本", isinstance(saved.get("days"), dict),
               str(list(saved.get("days", {}))))
-        check("落盘带 total_cost", "total_cost" in saved,
-              str(saved.get("total_cost")))
+        check("落盘只记电量、不记电费（电费是视图）",
+              "total_cost" not in saved and saved.get("ledger_version") == 2
+              and "total_peak_wh" in saved,
+              f"ledger_version={saved.get('ledger_version')} "
+              f"cost_keys={sorted(k for k in saved if 'cost' in k)}")
         check(f"每日账本保留 {meter_mod.HISTORY_DAYS} 天上限",
               meter_mod.HISTORY_DAYS >= 365, str(meter_mod.HISTORY_DAYS))
         check("落盘间隔缩到 15 秒内（少丢数据）",
@@ -1396,6 +1564,11 @@ def self_test() -> int:
     check("每一档都能反查出它属于哪级子菜单", all(found.values()), str(found))
     check("普通命令不会被当成选项（锚点为 None）",
           PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_RESET) is None)
+    # 「拖动把手 / 位置复位」是单号命令（不是档位），绝不能落进任何档位区间里 ——
+    # 落了就会被 _apply_strip_option 提前吃掉，静默退化成「点了一下没反应」。
+    check("拖动把手 / 位置复位不会被当成档位命令",
+          PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_TOGGLE_GRIP) is None
+          and PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_POS_RESET) is None)
     built = [
         PowerMonitorApp._build_menu(_MenuProbe(), anchor)
         for anchor in PowerMonitorApp.STRIP_MENUS
@@ -1403,6 +1576,10 @@ def self_test() -> int:
     check("每级子菜单都能单独建出来（继续弹的前提）",
           all(bool(handle) for handle in built),
           str([bool(handle) for handle in built]))
+    pos_menu = built[PowerMonitorApp.STRIP_MENUS.index("position")]
+    check("长条位置子菜单有两个入口（把手开关 + 位置复位）",
+          int(user32.GetMenuItemCount(pos_menu)) == 2,
+          f"{int(user32.GetMenuItemCount(pos_menu))} 项")
     root = PowerMonitorApp._build_menu(_MenuProbe(), PowerMonitorApp.ROOT_MENU)
     check("整张根菜单也能为「继续弹」重建（顶层勾选式开关用）",
           bool(root) and PowerMonitorApp.ROOT_MENU not in PowerMonitorApp.STRIP_MENUS)

@@ -246,7 +246,9 @@ def main() -> int:
     hint = window._controls.get(stats_mod.IDC_HINT)
     hbuf = ctypes.create_unicode_buffer(512)
     user32.GetWindowTextW(hint, hbuf, 512)
-    check("底部有数据来源说明", "账本保留" in hbuf.value, hbuf.value[:60])
+    check("底部说明了「点一行就能看明细」（不再黑箱的入口）",
+          "下面就是那一条" in hbuf.value, hbuf.value[:60])
+    check("底部有账本口径说明", "账本保留" in hbuf.value, hbuf.value[:80])
 
     # ---- 拼图 ----
     try:

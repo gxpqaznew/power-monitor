@@ -69,10 +69,14 @@ WM_SIZE = 0x0005
 WM_GETMINMAXINFO = 0x0024
 WM_SETREDRAW = 0x000B
 WM_ERASEBKGND = 0x0014
+WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_MOUSEMOVE = 0x0200
 WM_SETCURSOR = 0x0020
+# 捕获被抢走（Alt+Tab、弹出模态框等）时系统会发这个 —— 拖动状态必须在这里复位，
+# 否则光标早松手了长条还黏着鼠标。
+WM_CAPTURECHANGED = 0x0215
 WM_KEYDOWN = 0x0100
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
@@ -442,12 +446,17 @@ WS_EX_CLIENTEDGE = 0x00000200
 WS_EX_CONTROLPARENT = 0x00010000
 
 # 编辑框（EDIT）
+# ES_READONLY 是只读**且可以选中复制**，和把控件 Disable 掉不是一回事 ——
+# 详情框要做成只读可复制的（用户会想把某天的数字抄下来）。
 ES_LEFT = 0x0000
 ES_RIGHT = 0x0002
 ES_MULTILINE = 0x0004
+ES_READONLY = 0x0800
+ES_AUTOVSCROLL = 0x0040
 ES_AUTOHSCROLL = 0x0080
 EM_SETSEL = 0x00B1
 EM_SETLIMITTEXT = 0x00C5
+EM_LINESCROLL = 0x00B6
 
 # 下拉框（COMBOBOX）
 CBS_DROPDOWNLIST = 0x0003
@@ -586,3 +595,22 @@ user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetParent.argtypes = [wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
+
+# --- 长条拖动把手 ---
+# 光标：拖左右位置就该是「↔」，系统库里现成有（LoadCursorW 的 lpCursorName 是
+# MAKEINTRESOURCE，把整数当指针传）。
+IDC_SIZEWE = 32644
+IDC_HAND = 32649
+user32.SetCursor.argtypes = [wintypes.HANDLE]
+user32.SetCursor.restype = wintypes.HANDLE
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wintypes.BOOL
+# 命中测试：问系统「屏幕这一点上是哪个窗口」。验证「长条中间穿透、两端把手能抓」
+# 全靠它 —— 比真的动鼠标安全得多（不打扰用户正在用的桌面）。
+user32.WindowFromPoint.argtypes = [wintypes.POINT]
+user32.WindowFromPoint.restype = wintypes.HWND
+
+
+def int_resource(value: int):
+    """把整数资源 ID 转成 LoadCursorW 要的 ``LPCWSTR``（MAKEINTRESOURCE）。"""
+    return ctypes.cast(ctypes.c_void_p(value), wintypes.LPCWSTR)

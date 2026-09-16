@@ -21,6 +21,24 @@
 外观（质感 / 字号 / 尺寸 / 显示哪些字段）全部来自 ``cfg``，由 ``stripopts`` 统一
 解释。改任何一项都会走 ``_style_key()`` → ``_content_key()`` 变化 → 强制重画，
 不需要重建窗口。
+
+两个后加的东西值得单独讲：
+
+**拖动**（``_grip_*``）。整体保持穿透点击，所以自己收不到任何鼠标消息 —— 于是
+在胶囊两端各挂一个 15px 宽的「把手」子窗口（``WS_EX_LAYERED``，**不带**
+``WS_EX_TRANSPARENT``，所以能收到鼠标），把手自己画两列小圆点当抓手。位置存进
+``cfg.strip_offset_x``（设计基准像素，跟着 DPI / 任务栏大小缩放）。
+
+  踩过的坑：把手做成长条的**子窗口**是收不到鼠标的 —— 实测
+  ``WindowFromPoint`` 在把手上返回的是 ``Shell_TrayWnd``：父窗口的
+  ``WS_EX_TRANSPARENT`` 会把子窗口一起带成穿透。所以把手必须做成任务栏的
+  **兄弟窗口**（见 ``_grip_create``），z 序上再压在长条之上。
+
+**网格对齐**（``_grid``）。折行之后每一行各自从左往右排，同一个字段在两行里的
+起始 x 完全由前面几项有多宽决定 —— 两排的分隔线、数值全都不在一条竖线上，
+用户看一眼就说「没对齐、没质感」。改成表格：列数 = ceil(字段数 / 行数)，
+每列宽度取该列所有格子的最大值，于是**每一列在每一行都从同一个 x 开始、
+分隔线也在同一个 x**。单行时列宽就等于格子自身宽度，外观和以前逐像素一致。
 """
 
 from __future__ import annotations
@@ -42,6 +60,7 @@ from .w32 import (
     FW_NORMAL,
     GWL_STYLE,
     HWND_TOPMOST,
+    IDC_SIZEWE,
     NULL_BRUSH,
     PS_SOLID,
     SIZE,
@@ -51,19 +70,28 @@ from .w32 import (
     SWP_NOOWNERZORDER,
     SWP_NOSIZE,
     SWP_NOZORDER,
+    SWP_SHOWWINDOW,
     TRANSPARENT,
+    WM_CAPTURECHANGED,
     WM_DESTROY,
+    WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN,
+    WM_LBUTTONUP,
+    WM_MOUSEMOVE,
+    WM_SETCURSOR,
     WNDCLASSEXW,
     WNDPROC,
+    WS_CHILD,
     WS_EX_LAYERED,
-    WS_MAXIMIZE,
     WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST,
     WS_EX_TRANSPARENT,
+    WS_MAXIMIZE,
     WS_POPUP,
-    WS_CHILD,
+    WS_VISIBLE,
     gdi32,
+    int_resource,
     kernel32,
     user32,
     wintypes,
@@ -71,6 +99,24 @@ from .w32 import (
 
 _FONT_FACE = "Microsoft YaHei UI"
 _CLASS_NAME = "PowerMonitorTaskbarStrip"
+_GRIP_CLASS = "PowerMonitorStripGrip"
+
+# --------------------------------------------------------------- 拖动把手
+# 胶囊两端各一块「能收到鼠标」的区域（长条本体是穿透的，收不到）。宽度按设计基准
+# 48px 任务栏算，跟着 scale / 内边距倍数走。15px 差不多是「一眼看得见、又不抢戏」，
+# 加上整块高度（约 40px），抓起来很松。
+_GRIP_W = 15.0
+# 把手上那两列小圆点的几何（设计基准像素）：2 列 × 3 行，点半径 / 间距。
+_GRIP_DOT_R = 1.5
+_GRIP_DOT_GAP_X = 4.0
+_GRIP_DOT_GAP_Y = 4.6
+# 点的透明度（0~255）：平时很淡（像是在提示「这里可以抓」），按下去变清晰。
+_GRIP_ALPHA_IDLE = 96
+_GRIP_ALPHA_ACTIVE = 235
+# 把手的「命中底 alpha」：分层窗口按像素 alpha 判命中，alpha=0 的地方鼠标会
+# 穿过去，所以整块把手都要垫一个非 0 的 alpha（2/255 肉眼看不出来）。见 _grip_paint。
+_GRIP_HIT_ALPHA = 2
+# 拖动量的绝对值上限见 stripopts.OFFSET_LIMIT（配置文件校验那边也要用同一个数）
 
 # 设计基准：任务栏高度 48px 时的那套尺寸。真实尺寸按任务栏高度等比缩放，
 # 这样用户改「任务栏大小」或换 DPI 时长条会跟着变，不会显得突兀。
@@ -163,6 +209,10 @@ _PLAN_NUMBER = {
 _PLAN_UNIT = {
     "session": "kWh", "today": "kWh", "month": "kWh", "total": "kWh",
 }
+# 超宽容差（设计基准像素）：排版是按占位值算的，真实读数偶尔会多出一位
+# （「999 W」→「1000 W」）。只超这么一点点就**不藏**长条 —— 藏起来用户会以为
+# 功能坏了，宁可让胶囊往右多盖住开始按钮十来个像素。
+_PLAN_TOLERANCE = 14.0
 
 
 def _plan_cell(key: str, value: str, unit: str) -> tuple[str, str]:
@@ -188,6 +238,10 @@ def _plan_cell(key: str, value: str, unit: str) -> tuple[str, str]:
 
 _strips: dict[int, "TaskbarStrip"] = {}
 _strip_proc_ref: WNDPROC | None = None
+# 拖动把手（任务栏的兄弟窗口，不是长条的子窗口 —— 见模块 docstring）。
+# hwnd -> 长条实例，和 _strips 一样是给窗口过程查「这块把手归谁」用的。
+_grips: dict[int, "TaskbarStrip"] = {}
+_grip_proc_ref: WNDPROC | None = None
 
 
 def _colorref(r: int, g: int, b: int) -> int:
@@ -334,6 +388,19 @@ def _strip_proc(hwnd, msg, wparam, lparam):
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
+@WNDPROC
+def _grip_proc(hwnd, msg, wparam, lparam):
+    strip = _grips.get(hwnd)
+    if strip is not None:
+        try:
+            handled, result = strip._on_grip_message(hwnd, msg, wparam, lparam)
+            if handled:
+                return result
+        except Exception:  # noqa: BLE001 - 回调里不能让异常逃逸
+            pass
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
 class TaskbarStrip:
     """任务栏上的长条读数。所有窗口操作都在主线程做。"""
 
@@ -373,6 +440,27 @@ class TaskbarStrip:
         self._plan_height = 0      # 这一帧需要多高（_target_rect 拿它定窗口大小）
         self._radius = 0           # 这一帧用的圆角（多行时会收小）
         self._tw: dict[tuple, int] = {}   # 文本宽度缓存，见 _raw_text_width
+        # ---- 拖动把手 ----
+        # 左 / 右两块把手的 hwnd（任务栏的子窗口，和长条平级）
+        self._grip_hwnds: list[int] = []
+        self._grip_dc = None
+        self._grip_bmp = None
+        self._grip_old = None
+        self._grip_view = None
+        self._grip_w = 0
+        self._grip_h = 0
+        # 拖动中的状态。非 None 就是「正被拖」：里面记着按下时的光标 x 与长条左缘，
+        # 之后每个 WM_MOUSEMOVE 只算增量 —— 用增量而不是绝对位置，长条跟着光标走
+        # 时不会因为「窗口移动 → 客户区坐标跟着变」而产生反馈自激。
+        self._drag: dict | None = None
+        # 用户拖出来的横向偏移（设计基准像素；None = 还没跟 cfg 同步过）
+        self._offset_nominal: float | None = None
+        # 默认落点（不含拖动偏移）的屏幕 x。拖动时把「想去的 x」换算成偏移量要用它。
+        self._base_left = 0
+        # 最近一帧的配色（把手要用同样的 ink/dim 画小圆点）
+        self._pal: dict | None = None
+        # 最近一份快照：拖动时在消息回调里也要能重算落点，找不到 meter 就靠它
+        self._last_snap = None
 
     # ------------------------------------------------------------- 生命周期
 
@@ -419,6 +507,9 @@ class TaskbarStrip:
         self._parent = None
         self._topmost_at = 0.0
         self._hidden = True
+        # 拖动偏移从配置里接手（用户上次拖到哪儿就是哪儿）
+        self._offset_nominal = self._cfg_offset()
+        self._last_snap = snap
         # 先嵌进任务栏再显示，位置立刻按父窗口客户区坐标重排一次
         self._embed_into_taskbar()
         cl, ct, cr, cb = self._client_rect(target)
@@ -430,6 +521,8 @@ class TaskbarStrip:
         self._hidden = False
         self._ensure_above_siblings(force=True)
         self._render_if_needed(snap)
+        self._grip_create()
+        self._grip_render()
         if self._parent:
             debug.log("strip", f"创建成功 rect={target} 已嵌入任务栏 parent={self._parent:#x}")
         else:
@@ -437,6 +530,8 @@ class TaskbarStrip:
         return True
 
     def destroy(self) -> None:
+        self._drag = None
+        self._grip_destroy()
         if self._hwnd:
             _strips.pop(self._hwnd, None)
             user32.DestroyWindow(self._hwnd)
@@ -468,6 +563,308 @@ class TaskbarStrip:
             return True, 0
         # 穿透点击，别的消息一概不处理
         return False, 0
+
+    # ------------------------------------------------------- 拖动把手
+
+    def _on_grip_message(self, hwnd, msg, wparam, lparam):
+        """把手的窗口过程：拖动就是在这儿做的。
+
+        长条本体是穿透的、收不到鼠标，所以「拖动」这套动作全挂在两端的把手上。
+        """
+        if msg == WM_SETCURSOR:
+            # 水平拖动语义 → 系统的「↔」光标（用户一看就知道能拖）
+            user32.SetCursor(user32.LoadCursorW(None, int_resource(IDC_SIZEWE)))
+            return True, 1
+        if msg == WM_LBUTTONDOWN:
+            self._drag_start(hwnd)
+            return True, 0
+        if msg == WM_MOUSEMOVE:
+            if self._drag is not None:
+                self._drag_move()
+                return True, 0
+            return False, 0
+        if msg == WM_LBUTTONUP:
+            if self._drag is not None:
+                self._drag_end()
+                return True, 0
+            return False, 0
+        if msg == WM_LBUTTONDBLCLK:
+            # 双击把手 = 位置复位。拖歪了又不想翻菜单的人用得上。
+            self.reset_offset()
+            return True, 0
+        if msg == WM_CAPTURECHANGED:
+            # 捕获被系统抢走（Alt+Tab / 弹窗）：当成松手，别让长条继续黏着鼠标
+            if self._drag is not None:
+                self._drag_end()
+            return False, 0
+        return False, 0
+
+    def _cfg_offset(self) -> float:
+        """配置里记着的拖动偏移（设计基准像素）。"""
+        return stripopts.offset_x(self.cfg)
+
+    def _offset(self) -> float:
+        if self._offset_nominal is None:
+            return self._cfg_offset()
+        return self._offset_nominal
+
+    def reset_offset(self) -> None:
+        """回到默认落点（开始按钮左边那个位置）。"""
+        self._drag = None
+        self._offset_nominal = 0.0
+        self._persist_offset()
+        self.invalidate()
+
+    def set_grip_enabled(self, enabled: bool) -> None:
+        """开 / 关拖动把手（托盘菜单里那个勾）。"""
+        self._drag = None
+        if enabled:
+            self._grip_create()
+            self._grip_render()
+        else:
+            self._grip_destroy()
+
+    def _drag_start(self, hwnd) -> None:
+        if not self._rect:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        self._drag = {"cursor": pt.x, "left": self._rect[0]}
+        user32.SetCapture(hwnd)
+        self._grip_render()      # 按下就让点变清晰
+        debug.log("strip", f"开始拖动 left={self._rect[0]} cursor={pt.x}")
+
+    def _drag_move(self) -> None:
+        drag = self._drag
+        if drag is None or not self._hwnd:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        want = drag["left"] + (pt.x - drag["cursor"])
+        scale = self._scale or 1.0
+        # 存的是**相对默认落点的偏移**（设计基准像素），不是绝对屏幕 x —— 换 DPI、
+        # 改任务栏高度、改长条大小之后位置依然合理，不会跑到屏幕外面去。
+        self._offset_nominal = max(
+            -stripopts.OFFSET_LIMIT,
+            min(stripopts.OFFSET_LIMIT, (want - self._base_left) / scale),
+        )
+        self._drag_apply()
+
+    def _drag_apply(self) -> None:
+        """按当前偏移立刻把窗口搬过去（不等下一 tick，手感才跟手）。"""
+        target = self._target_rect(self._last_snap)
+        if target is None or target == self._rect:
+            return
+        cl, ct, cr, cb = self._client_rect(target)
+        user32.SetWindowPos(
+            self._hwnd, None, cl, ct, cr - cl, cb - ct,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        )
+        self._rect = target
+        self._grip_sync()
+        self._grip_raise()
+
+    def _drag_end(self) -> None:
+        self._drag = None
+        user32.ReleaseCapture()
+        self._persist_offset()
+        # 换了位置就要按新位置重新采一次任务栏底色（auto / 玻璃 / 线框三种质感
+        # 的底色是现场采样来的），顺手把把手的小圆点画回「淡」的样子。
+        self._key = None
+        self._render_if_needed(self._last_snap)
+        self._grip_render()
+        debug.log("strip", f"拖动结束 rect={self._rect} 偏移={self._offset():.1f}")
+
+    def _persist_offset(self) -> None:
+        try:
+            old = float(getattr(self.cfg, "strip_offset_x", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            old = 0.0
+        if abs(old - self._offset()) < 0.5:
+            return
+        try:
+            self.cfg.strip_offset_x = round(self._offset(), 1)
+            self.cfg.save()
+        except Exception:  # noqa: BLE001 - 存盘失败不该影响拖动本身
+            pass
+
+    def _grip_size(self, scale: float, height: int) -> tuple[int, int]:
+        pad_mult = stripopts.size_spec(self.cfg)[1]
+        return (max(8, int(round(_GRIP_W * scale * pad_mult))), max(8, int(height)))
+
+    def _grip_rects(self) -> list[tuple[int, int, int, int]]:
+        """左右两块把手在**任务栏客户区坐标**下的矩形（左、右）。"""
+        if not self._rect or not self._parent:
+            return []
+        left, top, right, bottom = self._rect
+        w, _h = self._grip_size(self._scale, bottom - top)
+        return [
+            self._client_rect((left, top, left + w, bottom)),
+            self._client_rect((right - w, top, right, bottom)),
+        ]
+
+    def _grip_create(self) -> None:
+        """建两块把手。
+
+        🔴 必须是**任务栏的兄弟窗口**，不能挂成长条的子窗口 —— 实测长条
+        （``WS_EX_TRANSPARENT``）的子窗口一样收不到鼠标：``WindowFromPoint``
+        在把手上返回的是 ``Shell_TrayWnd``。父窗口的透明属性会连带子窗口。
+        """
+        global _grip_proc_ref
+        self._grip_destroy()
+        if not self._parent or not self._rect or not stripopts.grip_enabled(self.cfg):
+            return
+        _grip_proc_ref = _grip_proc
+        hinstance = kernel32.GetModuleHandleW(None)
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        # CS_DBLCLKS：双击复位要用到 WM_LBUTTONDBLCLK
+        wc.style = 0x0008
+        wc.lpfnWndProc = _grip_proc
+        wc.hInstance = hinstance
+        wc.lpszClassName = _GRIP_CLASS
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            if ctypes.get_last_error() != 1410:
+                debug.log("strip", "把手 RegisterClassEx 失败")
+                return
+        # 注意：**不带** WS_EX_TRANSPARENT（这正是它能收到鼠标的原因）
+        ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        for l, t, r, b in self._grip_rects():
+            hwnd = user32.CreateWindowExW(
+                ex, _GRIP_CLASS, "PowerMonitorStripGrip", WS_CHILD | WS_VISIBLE,
+                l, t, r - l, b - t, self._parent, None, hinstance, None,
+            )
+            if not hwnd:
+                debug.log("strip", f"把手 CreateWindowEx 失败 err={ctypes.get_last_error()}")
+                continue
+            _grips[hwnd] = self
+            self._grip_hwnds.append(hwnd)
+        self._grip_raise()
+
+    def _grip_destroy(self) -> None:
+        for hwnd in self._grip_hwnds:
+            _grips.pop(hwnd, None)
+            try:
+                user32.DestroyWindow(hwnd)
+            except Exception:  # noqa: BLE001
+                pass
+        self._grip_hwnds = []
+        self._grip_release()
+
+    def _grip_release(self) -> None:
+        if self._grip_dc:
+            if self._grip_old:
+                gdi32.SelectObject(self._grip_dc, self._grip_old)
+            if self._grip_bmp:
+                gdi32.DeleteObject(self._grip_bmp)
+            gdi32.DeleteDC(self._grip_dc)
+        self._grip_dc = None
+        self._grip_bmp = None
+        self._grip_old = None
+        self._grip_view = None
+        self._grip_w = self._grip_h = 0
+
+    def _grip_sync(self) -> None:
+        """把手跟着长条走（长条搬家 / 改大小之后都要调）。"""
+        if not self._grip_hwnds:
+            return
+        rects = self._grip_rects()
+        if len(rects) != len(self._grip_hwnds):
+            self._grip_create()
+            return
+        for hwnd, (l, t, r, b) in zip(self._grip_hwnds, rects):
+            user32.SetWindowPos(
+                hwnd, 0, l, t, r - l, b - t,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )
+
+    def _grip_raise(self) -> None:
+        """把手压在长条之上（长条每次抢到 HWND_TOP 之后都要重申一次）。"""
+        for hwnd in self._grip_hwnds:
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+            )
+
+    def _grip_visible(self, visible: bool) -> None:
+        for hwnd in self._grip_hwnds:
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE if visible else 0)
+
+    def _grip_render(self) -> None:
+        """把两列小圆点画进把手自己的分层位图。配色跟着长条这一帧的配色走。"""
+        pal = self._pal
+        if pal is None or not self._grip_hwnds or not self._rect:
+            return
+        left, top, right, bottom = self._rect
+        w, h = self._grip_size(self._scale, bottom - top)
+        if self._grip_view is None or self._grip_w != w or self._grip_h != h:
+            self._grip_release()
+            screen = user32.GetDC(None)
+            try:
+                self._grip_dc = gdi32.CreateCompatibleDC(screen)
+                self._grip_bmp, self._grip_view = dib_section(self._grip_dc, w, h)
+            finally:
+                user32.ReleaseDC(None, screen)
+            if not self._grip_bmp:
+                self._grip_release()
+                return
+            self._grip_old = gdi32.SelectObject(self._grip_dc, self._grip_bmp)
+            self._grip_w, self._grip_h = w, h
+        # 注意：把手整块只画点，别的地方 alpha=0（完全透明）—— 覆盖在胶囊上时
+        # 看到的就是长条自己的底色，不会多出一块「补丁」。
+        self._grip_paint(w, h, pal, self._drag is not None)
+        rects = self._grip_rects()
+        for hwnd, (l, t, _r, _b) in zip(self._grip_hwnds, rects):
+            present_layered(hwnd, self._grip_dc, w, h, l, t)
+
+    def _grip_paint(self, w: int, h: int, pal: dict, active: bool) -> None:
+        """2 列 × 3 行的小圆点（标准的「抓手」记号），逐像素算覆盖率做抗锯齿。"""
+        view = self._grip_view
+        if view is None or w <= 0 or h <= 0:
+            return
+        # 🔴 整块垫一层 alpha=2/255 的底，不能是 0。
+        #
+        # 分层窗口（UpdateLayeredWindow）的**命中测试是按像素 alpha 走的**：
+        # alpha=0 的地方鼠标直接穿过去。踩过的坑：一开始除圆点外全是 0，结果
+        # 只有圆点那一小撮能点到，把手其余位置 WindowFromPoint 返回的是
+        # Shell_TrayWnd —— 看着有把手，实际几乎抓不住。
+        # 2/255 ≈ 0.8% 的压暗，肉眼看不出来，但足以让整块把手可点。
+        view[:] = (b"\x00\x00\x00" + bytes((_GRIP_HIT_ALPHA,))) * (w * h)
+        color = pal["ink"] if active else pal["dim"]
+        cr, cg, cb = _unpack(color)
+        alpha_max = _GRIP_ALPHA_ACTIVE if active else _GRIP_ALPHA_IDLE
+        if alpha_max <= 0:
+            return
+        scale = self._scale or 1.0
+        radius = max(0.7, _GRIP_DOT_R * scale)
+        gap_x = _GRIP_DOT_GAP_X * scale
+        gap_y = _GRIP_DOT_GAP_Y * scale
+        cx = w / 2.0 - gap_x / 2.0
+        cy = h / 2.0 - gap_y
+        for col in (0, 1):
+            for row in (0, 1, 2):
+                px = cx + col * gap_x
+                py = cy + row * gap_y
+                x0 = max(0, int(px - radius - 1))
+                x1 = min(w, int(px + radius + 2))
+                y0 = max(0, int(py - radius - 1))
+                y1 = min(h, int(py + radius + 2))
+                for y in range(y0, y1):
+                    for x in range(x0, x1):
+                        dx = x + 0.5 - px
+                        dy = y + 0.5 - py
+                        dist = (dx * dx + dy * dy) ** 0.5
+                        cover = radius + 0.5 - dist
+                        if cover <= 0.0:
+                            continue
+                        alpha = int(round(alpha_max * min(1.0, cover)))
+                        # 分层窗口要的是**预乘** alpha（RGB 已经乘过 alpha）
+                        idx = (y * w + x) * 4
+                        view[idx] = cb * alpha // 255
+                        view[idx + 1] = cg * alpha // 255
+                        view[idx + 2] = cr * alpha // 255
+                        view[idx + 3] = alpha
 
     # ------------------------------------------------------------- 资源
 
@@ -694,9 +1091,27 @@ class TaskbarStrip:
         top = bar_top + (bar_h - height) // 2
 
         left = right - width
-        # 左边放不下（上面已经按 available 缩过，走不到这儿；留个保险）
-        if left < screen[0] + 8:
-            left, right = screen[0] + 8, screen[0] + 8 + width
+        # 默认落点记下来：拖动时把「光标想去的 x」换算成偏移量要用它（见 _drag_move）
+        self._base_left = int(left)
+        # ---- 用户拖出来的横向偏移 ----
+        # 偏移量存的是设计基准像素（见 _drag_move 的注释），这里按 scale 还原成
+        # 真实像素再夹回「屏幕左边 8px ~ 通知区域左边」，拖不出可见范围。
+        offset = int(round(self._offset() * scale))
+        if offset:
+            left += offset
+            right += offset
+        min_left = screen[0] + 8
+        max_right = screen[2] - 8
+        tray = taskbar.notification_area()
+        if tray is not None:
+            # 往右最多到通知区域左边：那边是时钟和托盘图标，压上去就成了「挡住系统」
+            max_right = min(max_right, tray[0] - 8)
+        if max_right - width < min_left:
+            max_right = min_left + width
+        if left < min_left:
+            left, right = min_left, min_left + width
+        if right > max_right:
+            right, left = max_right, max_right - width
         return (int(left), int(top), int(right), int(top + height))
 
     def _width_cap(self, scale: float) -> float:
@@ -725,9 +1140,13 @@ class TaskbarStrip:
         finally:
             gdi32.DeleteDC(dc)
             user32.ReleaseDC(None, screen)
-        # 连「当前功率 + 本次电费」两段都塞不进可用宽度，就别硬塞了
-        if self._limit and width > self._limit:
-            return 0
+        # 连「当前功率 + 本次电费」两段都塞不进可用宽度，就别硬塞了。
+        # 留一位数字的余量（见 _PLAN_TOLERANCE）：规划用的是占位值，实际读数
+        # 偶尔会多一位，多出那十来像素不值得把整条藏掉。
+        if self._limit:
+            slack = int(round(_PLAN_TOLERANCE * (self._scale or 1.0)))
+            if width > self._limit + slack:
+                return 0
         return width
 
     def _layout(self, dc, scale: float, snap, render: bool,
@@ -739,10 +1158,12 @@ class TaskbarStrip:
         顺带返回配色，是为了让调用方（``_render_if_needed``）拿到 ``alpha`` /
         ``key`` 再透传给 ``compose_shape_alpha`` —— 半透明与抠色两种质感都得靠它。
 
-        **折行**：一行排不下所有勾选的字段时就往上加行（最多 ``_MAX_ROWS`` 行），
-        必要时把字号降一档换高度。行数只由「字段、可用宽度、可用的最大高度」
-        决定，跟传进来的 ``height`` 无关 —— 量宽和绘制两条路径因此必然得到
-        同一个计划，画出来的东西和窗口大小严丝合缝。
+        **折行 + 表格**：一行排不下所有勾选的字段时就往上加行（最多
+        ``_MAX_ROWS`` 行），必要时把字号降一档换高度；折行之后**不再各排各的**，
+        而是排成一张「行 × 列」的表格（``_grid``），这样两行的分隔线、每一列的
+        起点都在同一条竖线上。行数只由「字段、可用宽度、可用的最大高度」决定，
+        跟传进来的 ``height`` 无关 —— 量宽和绘制两条路径因此必然得到同一个计划，
+        画出来的东西和窗口大小严丝合缝。
 
         间距（标签间隙 / 单位间隙 / 分隔宽度）也由计划给出，不再在这里算：
         挤的时候 ``_plan`` 会收紧它们，量宽和绘制必须用同一套值。
@@ -752,6 +1173,7 @@ class TaskbarStrip:
 
         plan = self._plan(dc, snap, scale, limit, max_height)
         rows = plan["rows"]
+        grid = plan["grid"]
         fonts = plan["fonts"]
         gap_label = plan["gap_label"]
         gap_unit = plan["gap_unit"]
@@ -760,11 +1182,7 @@ class TaskbarStrip:
         pad_mult = stripopts.size_spec(self.cfg)[1]
         pad_x = _PAD_X * scale * pad_mult
 
-        width = int(round(
-            pad_x * 2 + max((self._row_width(dc, row, gap_label, gap_unit,
-                                            div_margin, fonts)
-                             for row in rows), default=0)
-        ))
+        width = int(round(pad_x * 2 + grid["width"]))
         row_h = plan["row_h"]
         content_h = max(int(round(row_h * len(rows))), 1)
         # 画布高度 = **窗口高度**（`_target_rect` 按 base_height / 内容高度算好的），
@@ -802,36 +1220,112 @@ class TaskbarStrip:
         gdi32.SelectObject(dc, old_pen)
         gdi32.SelectObject(dc, old_brush)
 
-        # ---- 逐行逐段 ----
+        # ---- 逐行逐列 ----
+        # 每一列都从 ``origin_x + pad_x + 前面所有列宽`` 开始，和行号无关 ——
+        # 这就是「两排对齐」的全部秘密：起点和分隔线的 x 只由列决定。
+        label_w = grid["label_w"]
+        col_w = grid["col_w"]
+        div_px = max(1, scale)
         for index, row in enumerate(rows):
             top = band_top + row_h * index
-            x = origin_x + pad_x
             mid = top + row_h / 2.0
-            for i, (_key, label, value, unit) in enumerate(row):
-                fonts_for = fonts
-                w_label = self._text_width(dc, label, fonts_for["label"])
-                w_value = self._text_width(dc, value, fonts_for["value"])
-                w_unit = (self._text_width(dc, unit, fonts_for["unit"])
-                          if unit else 0)
-
-                self._text(dc, label, x, top, w_label + 2, row_h,
-                           fonts_for["label"], pal["dim"])
-                x += w_label + gap_label
-                self._text(dc, value, x, top, w_value + 2, row_h,
-                           fonts_for["value"], pal["ink"])
-                x += w_value
+            x = origin_x + pad_x
+            for j, (_key, label, value, unit) in enumerate(row):
+                slot = label_w[j]
+                w_value = self._text_width(dc, value, fonts["value"])
+                self._text(dc, label, x, top, slot + 1, row_h,
+                           fonts["label"], pal["dim"])
+                vx = x + slot + gap_label
+                self._text(dc, value, vx, top, w_value + 2, row_h,
+                           fonts["value"], pal["ink"])
                 if unit:
-                    x += gap_unit
-                    self._text(dc, unit, x, top, w_unit + 2, row_h,
-                               fonts_for["unit"], pal["unit"])
-                    x += w_unit
-                if i < len(row) - 1:
+                    w_unit = self._text_width(dc, unit, fonts["unit"])
+                    self._text(dc, unit, vx + w_value + gap_unit, top,
+                               w_unit + 2, row_h, fonts["unit"], pal["unit"])
+                x += col_w[j]
+                if j < len(row) - 1:
                     x += div_margin
                     div_h = row_h * 0.46
-                    self._fill(dc, x, mid - div_h / 2, max(1, scale), div_h,
-                               pal["div"])
-                    x += max(1, scale) + div_margin
+                    self._fill(dc, x, mid - div_h / 2, div_px, div_h, pal["div"])
+                    x += div_px + div_margin
         return width, canvas_h, pal
+
+    # ------------------------------------------------------------- 网格排版
+
+    def _split(self, sections, rows_wanted: int) -> list[list[tuple]]:
+        """把字段摊成若干行：阅读顺序（从左到右、从上到下），每行尽量一样多。
+
+        列数 = ceil(字段数 / 行数)，于是每行要么 ``列数`` 个、要么少一个
+        （只有最后一行短）。行数取 ``min(rows_wanted, 字段数)`` —— 字段比行数
+        还少时不要摊出一堆空行。
+        """
+        n = len(sections)
+        if n <= 0:
+            return []
+        rows = max(1, min(int(rows_wanted), n))
+        cols = -(-n // rows)
+        return [list(sections[i * cols:(i + 1) * cols]) for i in range(rows)]
+
+    def _grid(self, dc, rows, fonts, gap_label, gap_unit, div_margin) -> dict:
+        """量出一张「行 × 列」表格：每列多宽、每个格子的标签槽多宽。
+
+        列宽 = 该列所有格子里的最大值（标签槽同理），所以：
+
+          * 每个格子在自己的列里**从同一个 x 开始**；
+          * 分隔线也跟着列宽走 → 两行的竖线在一条线上（用户要的「对齐」）；
+
+        数值一律按「占位值 / 真实值里更宽的那个」算：占位值（``_plan_cell``）
+        保证宽度不随读数变化（长条不会因为 999 W 变 1000 W 就抽一下），真实值
+        兜底保证再离谱的读数也不会被截掉。
+
+        单行列数 = 字段数，列宽就是格子自身宽度 —— 所以只勾几项时算出来的
+        尺寸和加折行之前**逐像素一致**。
+        """
+        cols = max((len(r) for r in rows), default=0)
+        label_w = [0.0] * cols
+        rest_w = [0.0] * cols
+        for row in rows:
+            for j, (key, label, value, unit) in enumerate(row):
+                w_label = self._text_width(dc, label, fonts["label"])
+                plan_value, plan_unit = _plan_cell(key, value, unit)
+                w_value = max(self._text_width(dc, value, fonts["value"]),
+                              self._text_width(dc, plan_value, fonts["value"]))
+                rest = w_value
+                if unit or plan_unit:
+                    w_unit = 0.0
+                    if unit:
+                        w_unit = self._text_width(dc, unit, fonts["unit"])
+                    if plan_unit:
+                        w_unit = max(w_unit,
+                                     self._text_width(dc, plan_unit, fonts["unit"]))
+                    rest = w_value + gap_unit + w_unit
+                label_w[j] = max(label_w[j], w_label)
+                rest_w[j] = max(rest_w[j], rest)
+        col_w = [label_w[j] + gap_label + rest_w[j] for j in range(cols)]
+        total = sum(col_w)
+        if cols > 1:
+            total += (cols - 1) * (div_margin * 2 + 1)
+        return {
+            "cols": cols, "col_w": col_w, "label_w": label_w, "rest_w": rest_w,
+            "width": total,
+        }
+
+    def _fit_sections(self, dc, sections, budget, rows_wanted, gap_label,
+                      gap_unit, div_margin, fonts) -> list[tuple]:
+        """在「最多 rows_wanted 行」的约束下，从后往前丢字段，返回排得下的前缀。
+
+        只用于「怎么都塞不下」的兜底：先尽量多排，而不是一上来就退回单行。
+        丢永远从**末尾**丢（末尾是「有余量才显示」的字段），长条左边的读数不会
+        因为勾得多而改变位置 —— 用户的眼睛盯着的就是最左边那几个数。
+        """
+        shown = list(sections)
+        while len(shown) > 1:
+            rows = self._split(shown, rows_wanted)
+            grid = self._grid(dc, rows, fonts, gap_label, gap_unit, div_margin)
+            if grid["width"] <= budget:
+                return shown
+            shown.pop()
+        return shown
 
     # ------------------------------------------------------------- 折行计划
 
@@ -849,67 +1343,6 @@ class TaskbarStrip:
     def _row_height(self, scale: float, font_scale: float) -> float:
         """一行要多高。比字号略大一点，否则两行的字会贴在一起。"""
         return _ROW_H * scale * font_scale
-
-    def _pack(self, dc, sections, budget, gap_label, gap_unit, div_margin,
-              fonts, planning: bool = True) -> list[list[tuple]]:
-        """把字段按可用宽度贪心折成若干行。
-
-        ``budget`` 是「一行能用的内容宽度」（已经减掉左右内边距）。单独一个字段
-        就超预算时它会独占一行 —— 宁可让它略微出格，也不要静默丢掉用户勾的项。
-
-        ``planning=True`` 时数值按固定占位量（见 ``_plan_cell``），这样「排几行」
-        不会跟着读数变。
-        """
-        rows: list[list[tuple]] = []
-        current: list[tuple] = []
-        for section in sections:
-            trial = current + [section]
-            if current and self._row_width(dc, trial, gap_label, gap_unit,
-                                           div_margin, fonts,
-                                           planning=planning) > budget:
-                rows.append(current)
-                current = [section]
-            else:
-                current = trial
-        if current:
-            rows.append(current)
-        return rows
-
-    def _row_width(self, dc, row, gap_label, gap_unit, div_margin, fonts,
-                   planning: bool = False) -> int:
-        """一行内容占多宽（不含左右内边距）。
-
-        ``planning=True`` 用占位数值（排版决策）；默认用真实数值（定窗口宽度）。
-        """
-        total = 0.0
-        for i, (key, label, value, unit) in enumerate(row):
-            if planning:
-                value, unit = _plan_cell(key, value, unit)
-            total += self._text_width(dc, label, fonts["label"])
-            total += gap_label
-            total += self._text_width(dc, value, fonts["value"])
-            if unit:
-                total += gap_unit + self._text_width(dc, unit, fonts["unit"])
-            if i < len(row) - 1:
-                total += div_margin * 2 + 1
-        return int(round(total))
-
-    def _fit_rows(self, dc, sections, budget, rows_wanted, gap_label, gap_unit,
-                  div_margin, fonts) -> list[tuple]:
-        """在「最多 rows_wanted 行」的约束下，从后往前丢字段，返回排得下的前缀。
-
-        只用于「怎么都塞不下」的兜底：先尽量多排，而不是一上来就退回单行。
-        丢永远从**末尾**丢（末尾是「有余量才显示」的字段），长条左边的读数不会
-        因为勾得多而改变位置 —— 用户的眼睛盯着的就是最左边那几个数。
-        """
-        shown = list(sections)
-        while len(shown) > 1:
-            rows = self._pack(dc, shown, budget, gap_label, gap_unit,
-                              div_margin, fonts)
-            if len(rows) <= rows_wanted:
-                return shown
-            shown.pop()
-        return shown
 
     def _plan(self, dc, snap, scale: float, limit: int, max_height: int) -> dict:
         """决定「排几行、用哪档字号、要不要换短标签 / 收紧间距」。
@@ -956,16 +1389,25 @@ class TaskbarStrip:
             return cache[compact]
 
         def attempt(compact, div_mult, gap_mult, rows_wanted, font_scale,
-                    density_index):
+                    density_index, keep: int | None = None):
+            """按这一组档位排一次，返回计划（含网格）。
+
+            ``keep`` 非 None 时只用前 ``keep`` 个字段 —— 兜底丢字段时用，
+            丢永远从末尾丢，所以剩下的必然是一个前缀。
+            """
             sections = sections_for(compact)
+            total = len(sections)
+            if keep is not None:
+                sections = sections[:max(1, keep)]
             gap_label = _GAP_LABEL * scale * gap_mult
             gap_unit = _GAP_UNIT * scale * gap_mult
             div_margin = _DIV_MARGIN * scale * div_mult
             fonts = self._fonts_for(scale, font_scale)
-            rows = self._pack(dc, sections, budget, gap_label, gap_unit,
-                              div_margin, fonts)
+            rows = self._split(sections, rows_wanted)
+            grid = self._grid(dc, rows, fonts, gap_label, gap_unit, div_margin)
             return {
                 "rows": rows,
+                "grid": grid,
                 "font_scale": font_scale,
                 "row_h": self._row_height(scale, font_scale),
                 "fonts": fonts,
@@ -973,7 +1415,7 @@ class TaskbarStrip:
                 "gap_unit": gap_unit,
                 "div_margin": div_margin,
                 "placed": sum(len(r) for r in rows),
-                "total": len(sections),
+                "total": total,
                 "density": density_index,
                 "compact": compact,
             }
@@ -988,7 +1430,7 @@ class TaskbarStrip:
                     continue
                 plan = attempt(compact, div_mult, gap_mult, rows_wanted,
                                font_scale, index)
-                if len(plan["rows"]) <= rows_wanted:
+                if plan["grid"]["width"] <= budget:
                     return plan
 
         # ---- 第二遍：怎么都塞不下，选「丢得最少」的那个方案 ----
@@ -1004,35 +1446,20 @@ class TaskbarStrip:
                     continue
                 if index and rows_wanted == 1 and font_scale == base_font:
                     continue
-                shown = self._fit_rows(
+                shown = self._fit_sections(
                     dc, sections, budget, rows_wanted,
                     _GAP_LABEL * scale * gap_mult, _GAP_UNIT * scale * gap_mult,
                     _DIV_MARGIN * scale * div_mult,
                     self._fonts_for(scale, font_scale),
                 )
-                if best is not None and len(shown) <= best["_shown"]:
+                if best is not None and len(shown) <= best["placed"]:
                     continue
-                plan = attempt(compact, div_mult, gap_mult, rows_wanted,
-                               font_scale, index)
-                # 用丢掉之后的字段重新排一次：上面 attempt 排的是全量
-                fonts = plan["fonts"]
-                rows = self._pack(dc, shown, budget, plan["gap_label"],
-                                  plan["gap_unit"], plan["div_margin"], fonts)
-                plan["rows"] = rows
-                plan["placed"] = sum(len(r) for r in rows)
-                plan["_shown"] = len(shown)
-                best = plan
+                best = attempt(compact, div_mult, gap_mult, rows_wanted,
+                               font_scale, index, keep=len(shown))
 
         if best is None:
             # 理论上到不了这儿（字段至少 1 个，总能排下）；真到了就退回最保守的形态
-            sections = sections_for(False) or [("current", "当前", "0", "W")]
-            fonts = self._fonts_for(scale, base_font)
-            plan = attempt(False, 1.0, 1.0, 1, base_font, 0)
-            plan["rows"] = self._pack(dc, sections[:1], budget,
-                                      _GAP_LABEL * scale, _GAP_UNIT * scale,
-                                      _DIV_MARGIN * scale, fonts)
-            plan["placed"] = 1
-        best.pop("_shown", None)
+            best = attempt(False, 1.0, 1.0, 1, base_font, 0, keep=1)
         return best
 
     def _highlight(self, total: int, height: int, origin_x: int, origin_y: int,
@@ -1116,13 +1543,20 @@ class TaskbarStrip:
         if self._should_hide():
             if not self._hidden:
                 user32.ShowWindow(self._hwnd, 0)
+                self._grip_visible(False)
                 self._hidden = True
+            return
+
+        # 正在拖：位置由鼠标说了算，这一刻不要按锚点重算（否则会和手抢，抖）
+        if self._drag is not None:
+            self._grip_sync()
             return
 
         target = self._target_rect(snap)
         if target is None:
             if not self._hidden:
                 user32.ShowWindow(self._hwnd, 0)
+                self._grip_visible(False)
                 self._hidden = True
             return
 
@@ -1130,6 +1564,7 @@ class TaskbarStrip:
             user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
             self._hidden = False
             self._key = None
+            self._grip_visible(True)
             # 刚从隐藏恢复，立刻把层级重新声明一次，避免被任务栏压到下面
             # （否则会出现「消失一下、过两秒才冒出来」的错觉）。
             self._ensure_above_siblings(force=True)
@@ -1142,6 +1577,7 @@ class TaskbarStrip:
             )
             self._rect = target
             self._key = None
+            self._grip_sync()
             debug.log("strip", f"移动到 {target}")
 
         self._ensure_above_siblings()
@@ -1194,6 +1630,9 @@ class TaskbarStrip:
                 self._hwnd, 0, 0, 0, 0, 0,  # HWND_TOP：兄弟窗口里排最前
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             )
+            # 把手再压一层：它也必须是「兄弟里最前」，否则会被长条的胶囊底盖住，
+            # 小圆点就看不见了（长条是透明的，所以即使把手在下也还能点，只是不好看）
+            self._grip_raise()
         else:
             user32.SetWindowPos(
                 self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1244,6 +1683,8 @@ class TaskbarStrip:
         return covers
 
     def _render_if_needed(self, snap) -> None:
+        if snap is not None:
+            self._last_snap = snap
         key = self._content_key(snap)
         if key == self._key and self._view is not None:
             return
@@ -1290,3 +1731,7 @@ class TaskbarStrip:
         cl, ct, _cr, _cb = self._client_rect(self._rect)
         present_layered(self._hwnd, self._mem_dc, w, h, cl, ct)
         self._key = key
+        # 把手要用这一帧的配色画小圆点（换质感 / 换深浅时跟着变），顺便对齐位置
+        self._pal = pal
+        self._grip_sync()
+        self._grip_render()

@@ -1,4 +1,4 @@
-开机能耗统计 v1.0.8 自检
+开机能耗统计 v1.0.9 自检
 frozen=False  python=3.13.14
 exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
@@ -8,9 +8,9 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 电费模式按量级调精度  (0.32/12.4/103)
 [PASS] 图标文本不超过 4 个字符（放不下会被截断）  ({'current': 3, 'cost': 4, 'session': 3, 'average': 3})
 [PASS] 长条能排出 4 个字段
-[PASS] 长条宽度算得出来  (652px)
+[PASS] 长条宽度算得出来  (741px)
 [PASS] 单行时画布占满胶囊高度（不会画出矮一截的胶囊）  (47 == 47)
-[PASS] 长条内部 alpha 补满（没有透明空洞）  (652/652)
+[PASS] 长条内部 alpha 补满（没有透明空洞）  (741/741)
 [PASS] 长条质感有 6 档  (auto、glass、outline、dark、light、accent)
 [PASS] 长条字号有 6 档（含折行兜底的极小）
 [PASS] 长条大小有 3 档
@@ -20,18 +20,24 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 最后一项显示内容不允许取消
 [PASS] 新勾的项按目录顺序插回（不甩到末尾）  (['current', 'cpu', 'uptime'])
 [PASS] 手改出来的非法配置能夹回合法档  (auto/normal/1.5/['current', 'cost', 'session', 'today'])
+[PASS] 不拖时偏移就是 0（默认落点）
+[PASS] 把手默认是开的（没有把手就拖不动）
+[PASS] 手改出来的拖动偏移会被夹住、把手开关会转成布尔  (4000.0/True)
+[PASS] 偏移写成非数字时退回 0（不能让长条算不出位置）  (0.0)
 [PASS] 质感「跟随任务栏」画得出来且内部无空洞  (alpha=255 全部命中)
 [PASS] 质感「玻璃」画得出来且内部无空洞  (alpha=200 全部命中)
-[PASS] 质感「线框」画得出来且内部无空洞  (可见 226/517px)
+[PASS] 质感「线框」画得出来且内部无空洞  (可见 226/590px)
 [PASS] 质感「深色卡片」画得出来且内部无空洞  (alpha=236 全部命中)
 [PASS] 质感「浅色卡片」画得出来且内部无空洞  (alpha=242 全部命中)
 [PASS] 质感「强调色」画得出来且内部无空洞  (alpha=244 全部命中)
 [PASS] 半透明合成逐行一致（没有横条纹）  (1 种：[(188, 181, 175, 200)])
-[PASS] 字号调大会让长条变宽  (525px → 742px)
+[PASS] 字号调大会让长条变宽  (598px → 856px)
 [PASS] 大字号 + 宽大档内部无空洞  (alpha=[255])
 [PASS] 可用 883px：8 项全勾一个不丢  (排上 8/8，2 行，密度档 0，字号 0.85)
 [PASS] 字段多的时候确实折了行  (2 行)
-[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=891)
+[PASS] 折行摊成表格：每行格数只差一个（第一行多一格）  ([4, 4])
+[PASS] 每列宽度 ≥ 该列任何一个格子所需（不会把字截掉）  (4 列 / 列宽 [91, 166, 166, 166])
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=864)
 [PASS] 电价设置窗口能建出来
 [PASS] 省份项数 = 预设数 + 1 个自定义
 [PASS] 打开时定位到默认省份  (四川)
@@ -46,9 +52,10 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 旧版的单日数字折进了每日账本  (['2026-09-15'])
 [PASS] 本月电量 = 当月各天之和  (2592.2 Wh / 1 天)
 [PASS] 累计电量沿用旧账  (3605.7 Wh)
-[PASS] 旧账缺 total_cost 时按每日账本补齐  (¥1.11)
+[PASS] 旧账没有电费字段也能算出累计电费（按电量现算）  (¥1.88（按 ¥0.5224/kWh 估）)
+[PASS] 电费单调：累计 ≥ 本次 ≥ 今日  (累计 ¥1.88 ≥ 本次 ¥0.00 ≥ 今日 ¥0.00)
 [PASS] 落盘能读回每日账本  (['2026-09-15'])
-[PASS] 落盘带 total_cost  (1.1112)
+[PASS] 落盘只记电量、不记电费（电费是视图）  (ledger_version=2 cost_keys=[])
 [PASS] 每日账本保留 400 天上限  (400)
 [PASS] 落盘间隔缩到 15 秒内（少丢数据）  (15.0s)
 [PASS] 账本留有『上一代』副本（state.json.prev）  (state.json.prev)
@@ -56,8 +63,10 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 累计类长条字段都算得出文本  ({'month': ('本月', '12.3', 'kWh'), 'total': ('累计', '156.70', 'kWh'), 'total_cost': ('累计电费', '¥81.90', '')})
 [PASS] 每一档都能反查出它属于哪级子菜单  ({'theme': True, 'font': True, 'size': True, 'field': True})
 [PASS] 普通命令不会被当成选项（锚点为 None）
-[PASS] 每级子菜单都能单独建出来（继续弹的前提）  ([True, True, True, True])
+[PASS] 拖动把手 / 位置复位不会被当成档位命令
+[PASS] 每级子菜单都能单独建出来（继续弹的前提）  ([True, True, True, True, True])
+[PASS] 长条位置子菜单有两个入口（把手开关 + 位置复位）  (2 项)
 [PASS] 整张根菜单也能为「继续弹」重建（顶层勾选式开关用）
 [PASS] 顶层三个勾选式开关都登记成「点完不关」  (3)
 
-通过 57 项，失败 0 项
+通过 66 项，失败 0 项

@@ -10,9 +10,34 @@
   开机后到程序启动前的部分无从测量，因此额外给一个按均值外推的
   参考值，并明确标注是估算。
 
-**计费**：按用户所在地区的居民电价分时段累计。时段与电价都来自配置
-（``peak_hours`` / ``valley_hours`` 与三个单价），所以在托盘菜单
-「电价设置…」里换成自己省份的预设即可，计价逻辑不用改。
+**计费：账本只记电量，电费是电量的一个「视图」**（v1.1.0 起的核心约定）。
+
+早期版本把电费当成独立累加器（``total_cost`` / ``session_cost`` 各加各的），
+结果是这两条数会**互相矛盾**：实测用户账本里出现「累计电量 = 本次电量 = 3.70 kWh，
+但累计电费 ¥1.16 < 本次电费 ¥1.64」——因为 ``total_cost`` 是从**残缺的每日账本**
+回填的（旧版本只存了当天一个桶，更早的历史只活在 total_wh 里），而 ``session_cost``
+继承的是老版本在**旧电价**下累加的值。两者来源不同，就会出现「累计比本次还低」
+这种物理上不可能的数字。
+
+现在的做法：每个维度的账目只存**电量**，并按「峰 / 平 / 谷」拆开
+（谷段还要分丰枯，所以必须存拆分量才可能算对单价）：
+
+* ``wh`` / ``peak`` / ``valley`` → 平段电量 = ``wh - peak - valley``（不会为负，读了会夹）
+* 电费一律由 ``_blend()`` 现算：``峰×峰价 + 平×平价 + 谷×谷价``，
+  谷价按**那一天所在的月份**决定丰/枯。
+
+由此得到两个必然成立的性质，它们就是这套设计的意义：
+
+1. **累计 ≥ 今年 ≥ 本月 ≥ 今日，且 累计 ≥ 本次**（同一套单价、电量单调，
+   电费只是电量的单调映射）；「累计电费比本次电费低」在结构上不可能再发生。
+2. **改了电价，所有历史数字一起跟着变**——因为电费从来不是存下来的。
+   这也符合直觉：用户把电价改成账单上的数，当然希望历史电费按新价重算。
+
+旧账（v1）里那些只有 ``[电量, 电费, 秒数]`` 没有峰谷拆分的记录，迁移时按
+**整体观测到的峰谷比例**补齐（而不是一律算平段——那样会和总量对不上）。
+
+时段与电价都来自配置（``peak_hours`` / ``valley_hours`` 与三个单价），
+所以在托盘菜单「电价设置…」里换成自己省份的预设即可，计价逻辑不用改。
 """
 
 from __future__ import annotations
@@ -49,6 +74,11 @@ HISTORY_DAYS = 400
 HISTORY_SESSIONS = 240
 # 时段分布的桶数（0~23 点）
 HOUR_BUCKETS = 24
+# 账本格式版本。
+#   v1：每条 [电量, 电费, 秒数(, 最后采样)] —— 电费是独立累加器，会互相矛盾
+#   v2：每条 [电量, 秒数, (最后采样), 峰电量, 谷电量] —— 只存电量，电费现算
+# 有版本号才能无歧义地区分两者（只靠数组长度猜太脆）。
+LEDGER_VERSION = 2
 
 
 def _num_seq(source, index: int, default: float = 0.0) -> float:
@@ -103,6 +133,54 @@ def _duration(seconds: float) -> str:
     if hours:
         return f"{hours}h{mins:02d}m"
     return f"{mins}m"
+
+
+def day_tm(day: str) -> time.struct_time | None:
+    """``"YYYY-MM-DD"`` → struct_time；读不出来返回 None（坏日期不能崩）。"""
+    try:
+        return time.strptime(day[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def valley_rate(cfg: Config, tm: time.struct_time | None = None) -> float:
+    """谷段单价 —— 按 ``tm`` 所在月份决定丰水期还是枯平水期。"""
+    month = (tm or time.localtime()).tm_mon
+    wet = month in (cfg.valley_wet_months or ())
+    return cfg.price_valley_wet if wet else cfg.price_valley_dry
+
+
+def blend_cost(cfg: Config, tm: time.struct_time | None,
+               wh: float, peak_wh: float, valley_wh: float) -> float:
+    """由电量按**当前电价**算电费。这是全程序唯一的电费算法。
+
+    峰 / 谷电量超出总量时（手改过账本）夹回，保证平段电量不为负 ——
+    否则会出现「负电量」这种会让用户彻底不信账的数字。
+    """
+    if wh <= 0.0:
+        return 0.0
+    peak_wh = min(max(0.0, peak_wh), wh)
+    valley_wh = min(max(0.0, valley_wh), wh - peak_wh)
+    flat_wh = wh - peak_wh - valley_wh
+    return (peak_wh * cfg.price_peak
+            + flat_wh * cfg.price_flat
+            + valley_wh * valley_rate(cfg, tm)) / 1000.0
+
+
+def split_by_ratio(wh: float, peak_ratio: float,
+                   valley_ratio: float) -> tuple[float, float]:
+    """按给定比例把一段电量拆成 (峰, 谷)。
+
+    只用于**旧账迁移**：老账目没有峰谷拆分，若一律当平段计，会和总量对不上
+    （用户的账本里平段电量为 0，正是因为老版本的峰谷电量已经覆盖了全部电量），
+    于是「每日账本电费之和」会大于「累计电费」。按整体观测到的比例补齐，
+    每日合计恰好等于总量，两边的电费也就自动一致了。
+    """
+    if wh <= 0.0:
+        return 0.0, 0.0
+    peak = max(0.0, min(1.0, peak_ratio)) * wh
+    valley = max(0.0, min(1.0 - peak_ratio, valley_ratio)) * wh
+    return peak, valley
 
 
 def segment_of(cfg: Config, when: time.struct_time | None = None) -> str:
@@ -232,29 +310,27 @@ class EnergyMeter:
         self._stop = threading.Event()
         self._stopped = False
 
-        # 本次会话
+        # 本次会话。电费不在这里存 —— 它由 (wh, _peak_wh, _valley_wh) 现算，
+        # 见 blend_cost()。
         self._power_on_ts: float = 0.0
         self._power_on_source: str = "-"
         self._first_seen_ts: float = 0.0
         self._session_wh: float = 0.0
-        self._session_cost: float = 0.0
         self._peak_wh: float = 0.0
         self._valley_wh: float = 0.0
         self._peak_w: float = 0.0
         self._samples: int = 0
         self._covered_seconds: float = 0.0
 
-        # 今日
+        # 今日（只有日期 + 电量；今天是哪天由 _days 里的条目表达）
         self._today_date: str = ""
-        self._today_wh: float = 0.0
-        self._today_cost: float = 0.0
 
-        # 每日账本：{"YYYY-MM-DD": {"wh":…, "cost":…, "seconds":…}}
+        # 每日账本：{"YYYY-MM-DD": {"wh","peak","valley","seconds"}}
         # 这是「关掉再打开还能看到以前每天用了多少」的唯一来源 —— 只存一个
         # total 是不够的，用户要看的是「哪天用了多少」。
         self._days: dict[str, dict[str, float]] = {}
 
-        # 每次开机的明细：{开机时刻(int): {"wh","cost","seconds","last"}}
+        # 每次开机的明细：{开机时刻(int): {"wh","peak","valley","seconds","last"}}
         # 「每次开机」不等于「当前这次」—— 用户要的是能把历史每一次翻出来看，
         # 所以按开机时刻（Kernel-Boot 事件）分条存，同一次开机内重开程序接上同一条。
         self._sessions: dict[int, dict[str, float]] = {}
@@ -262,11 +338,16 @@ class EnergyMeter:
 
         # 时段分布：[0 点, 1 点, … 23 点] 各自累计了多少 Wh。
         # 用来回答「这台机器一天里什么时候最费电」，比总量有意思得多。
+        # 谷段电量单独记一列，否则按时段表的电费只能按平段估算。
         self._hours: list[float] = [0.0] * HOUR_BUCKETS
+        self._hours_valley: list[float] = [0.0] * HOUR_BUCKETS
 
-        # 全局
+        # 全局（开程序以来所有天，**不随 400 天裁剪而减少**）。
+        # 峰 / 谷电量一起记，累计电费才能由它现算 —— 只存一个 total_wh 是
+        # 「累计电费靠回填、和本次对不上」的根源。
         self._total_wh: float = 0.0
-        self._total_cost: float = 0.0
+        self._total_peak_wh: float = 0.0
+        self._total_valley_wh: float = 0.0
         self._total_sessions: int = 0
 
         self._latest: Reading | None = None
@@ -307,8 +388,10 @@ class EnergyMeter:
             except (OSError, json.JSONDecodeError):
                 state = {}
 
+        self._ledger_version = int(_num(state, "ledger_version", 1.0))
         self._total_wh = _num(state, "total_wh")
-        self._total_cost = _num(state, "total_cost")
+        self._total_peak_wh = _num(state, "total_peak_wh")
+        self._total_valley_wh = _num(state, "total_valley_wh")
         self._total_sessions = int(_num(state, "total_sessions"))
 
         # 以「本次开机时刻」作为会话标识：同一次开机内重开程序接着上次记账，
@@ -318,7 +401,6 @@ class EnergyMeter:
         if same_session:
             self._first_seen_ts = float(state.get("first_seen_ts", time.time()))
             self._session_wh = _num(state, "session_wh")
-            self._session_cost = _num(state, "session_cost")
             self._peak_wh = _num(state, "peak_wh")
             self._valley_wh = _num(state, "valley_wh")
             self._peak_w = _num(state, "peak_w")
@@ -335,15 +417,38 @@ class EnergyMeter:
             self._first_seen_ts = time.time()
             self._total_sessions += 1
 
+        # 旧账没有全局峰谷电量时，用本次会话的峰谷比例反推全局 —— 实测用户的旧账本里
+        # 「峰 + 谷」正好等于全部电量（平段为 0），直接照搬比例能让「每日合计」和
+        # 「累计」自动对上；比例未知（全是平段）时就是 0，也自洽。
+        if self._total_peak_wh <= 0.0 and self._total_valley_wh <= 0.0:
+            self._migrate_total_split(state)
+
         self._restore_days(state)
         self._restore_sessions(state)
         self._restore_hours(state)
 
-        # 旧版没有 total_cost（只存了 session/today 的电费）。如果 days 里已经
-        # 有历史电费，就把它补齐 —— 否则「累计电量」几千瓦时、「累计电费」却是
-        # ¥0.00，看着像坏了。（days 有 400 天上限，所以这只是个下限，够用。）
-        if self._total_cost <= 0.0:
-            self._total_cost = sum(item["cost"] for item in self._days.values())
+    def _migrate_total_split(self, state: dict) -> None:
+        """旧账补齐全局峰/谷电量（按会话的峰谷比例缩放）。"""
+        peak = _num(state, "peak_wh")
+        valley = _num(state, "valley_wh")
+        span = peak + valley
+        if span <= 0.0 or self._total_wh <= 0.0:
+            return
+        scale = self._total_wh / span
+        self._total_peak_wh = peak * scale
+        self._total_valley_wh = valley * scale
+
+    def _legacy_split_ratio(self) -> tuple[float, float]:
+        """旧账迁移用的 (峰比例, 谷比例)。没有拆分信息时返回 (0, 0)（即全按平段）。
+
+        这是 v1 → v2 迁移的关键：老账目只有「电量 + 电费」，没有峰谷拆分。
+        若一律按平段补，每日合计会比累计还大（实测用户账本平段电量为 0），
+        补出来的账自己就打自己脸。按观测比例补齐，两边自动相等。
+        """
+        span = self._total_peak_wh + self._total_valley_wh
+        if span <= 0.0 or self._total_wh <= 0.0:
+            return 0.0, 0.0
+        return self._total_peak_wh / self._total_wh, self._total_valley_wh / self._total_wh
 
     def _restore_days(self, state: dict) -> None:
         """恢复每日账本，并把旧版「今日」字段折算进去。
@@ -354,27 +459,42 @@ class EnergyMeter:
         这里做两件事：
           1. 把旧字段按它自己的 today_date 折进 days（不丢最后那一天）；
           2. 把 days 里今天的条目接上，让程序重启后「今日」接着算。
+
+        每条要读两种写法：
+          * v2（自己写出去的）``[电量, 秒数, 峰电量, 谷电量]``
+          * v1（老版本）``[电量, 电费, 秒数]`` —— 电费丢弃（它已经不可信），
+            峰谷按整体观测比例补齐
+          * 用户手改成 ``{"wh":…}`` 对象的，也认
         """
+        peak_ratio, valley_ratio = self._legacy_split_ratio()
+        version = getattr(self, "_ledger_version", 1)
         raw = state.get("days")
         if isinstance(raw, dict):
             for day, item in raw.items():
                 key = str(day)[:10]
                 if len(key) != 10 or key[4] != "-":
                     continue
-                # 自己写出去的是 [电量, 电费, 秒数]；手改过的可能是对象写法，
-                # 两种都认，免得用户编辑一下文件整本账就哑了。
                 if isinstance(item, dict):
-                    wh, cost, seconds = (
-                        _num(item, "wh"), _num(item, "cost"), _num(item, "seconds"),
-                    )
+                    wh = _num(item, "wh")
+                    seconds = _num(item, "seconds")
+                    peak = _num(item, "peak")
+                    valley = _num(item, "valley")
                 elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    wh, cost = _num_seq(item, 0), _num_seq(item, 1)
-                    seconds = _num_seq(item, 2)
+                    wh = _num_seq(item, 0)
+                    if version >= 2:
+                        # [电量, 秒数, 峰, 谷]
+                        seconds = _num_seq(item, 1)
+                        peak, valley = _num_seq(item, 2), _num_seq(item, 3)
+                    else:
+                        # [电量, 电费, 秒数] —— 电费没有拆分，按比例补
+                        seconds = _num_seq(item, 2)
+                        peak, valley = split_by_ratio(wh, peak_ratio, valley_ratio)
                 else:
                     continue
                 self._days[key] = {
                     "wh": max(0.0, wh),
-                    "cost": max(0.0, cost),
+                    "peak": max(0.0, peak),
+                    "valley": max(0.0, valley),
                     "seconds": max(0.0, seconds),
                 }
 
@@ -382,9 +502,11 @@ class EnergyMeter:
         legacy_date = str(state.get("today_date", ""))[:10]
         legacy_wh = _num(state, "today_wh")
         if legacy_date and legacy_wh > 0 and legacy_date not in self._days:
+            peak, valley = split_by_ratio(legacy_wh, peak_ratio, valley_ratio)
             self._days[legacy_date] = {
                 "wh": legacy_wh,
-                "cost": _num(state, "today_cost"),
+                "peak": peak,
+                "valley": valley,
                 "seconds": 0.0,
             }
 
@@ -392,12 +514,8 @@ class EnergyMeter:
 
         today = self._today_key()
         self._today_date = today
-        if today in self._days:
-            self._today_wh = self._days[today]["wh"]
-            self._today_cost = self._days[today]["cost"]
-        else:
-            self._today_wh = 0.0
-            self._today_cost = 0.0
+        # 今日电量没有单独的累加器 —— 它就是 days 里今天那一条（单一真源），
+        # snapshot() 直接取，省掉一个必然会和账本对不上的副本。
 
     def _prune_days(self) -> None:
         """只留最近 HISTORY_DAYS 天（按日期字符串排序，格式是 YYYY-MM-DD）。"""
@@ -418,6 +536,8 @@ class EnergyMeter:
 
         这正是用户说的「每次开机后分别用了多少（每次，不是当前次）」。
         """
+        peak_ratio, valley_ratio = self._legacy_split_ratio()
+        version = getattr(self, "_ledger_version", 1)
         raw = state.get("sessions")
         pairs: list[tuple[object, object]] = []
         if isinstance(raw, dict):
@@ -432,16 +552,25 @@ class EnergyMeter:
             if boot <= 0:
                 continue
             if isinstance(item, dict):
-                wh, cost = _num(item, "wh"), _num(item, "cost")
+                wh = _num(item, "wh")
                 seconds, last = _num(item, "seconds"), _num(item, "last")
+                peak, valley = _num(item, "peak"), _num(item, "valley")
             elif isinstance(item, (list, tuple)) and len(item) >= 3:
-                wh, cost = _num_seq(item, 0), _num_seq(item, 1)
-                seconds, last = _num_seq(item, 2), _num_seq(item, 3)
+                wh = _num_seq(item, 0)
+                if version >= 2:
+                    # [电量, 秒数, 最后采样, 峰, 谷]
+                    seconds, last = _num_seq(item, 1), _num_seq(item, 2)
+                    peak, valley = _num_seq(item, 3), _num_seq(item, 4)
+                else:
+                    # [电量, 电费, 秒数, 最后采样] —— 电费丢弃，按比例补峰谷
+                    seconds, last = _num_seq(item, 2), _num_seq(item, 3)
+                    peak, valley = split_by_ratio(wh, peak_ratio, valley_ratio)
             else:
                 continue
             self._sessions[boot] = {
                 "wh": max(0.0, wh),
-                "cost": max(0.0, cost),
+                "peak": max(0.0, peak),
+                "valley": max(0.0, valley),
                 "seconds": max(0.0, seconds),
                 "last": last or float(boot),
             }
@@ -453,7 +582,8 @@ class EnergyMeter:
         if entry is None:
             self._sessions[boot_key] = {
                 "wh": 0.0,
-                "cost": 0.0,
+                "peak": 0.0,
+                "valley": 0.0,
                 "seconds": 0.0,
                 "last": max(self._first_seen_ts, boot_key),
             }
@@ -468,52 +598,60 @@ class EnergyMeter:
         keep = sorted(self._sessions)[-HISTORY_SESSIONS:]
         self._sessions = {k: self._sessions[k] for k in keep}
 
-    def _bump_session(self, ts: float, wh: float, cost: float,
+    def _bump_session(self, ts: float, wh: float, peak: float, valley: float,
                       seconds: float) -> None:
         """把这一笔记到**本次开机**头上。调用方必须已持有 ``self._lock``。"""
         item = self._sessions.get(self._boot_key)
         if item is None:
-            item = {"wh": 0.0, "cost": 0.0, "seconds": 0.0, "last": ts}
+            item = {"wh": 0.0, "peak": 0.0, "valley": 0.0,
+                    "seconds": 0.0, "last": ts}
             self._sessions[self._boot_key] = item
         item["wh"] += wh
-        item["cost"] += cost
+        item["peak"] += peak
+        item["valley"] += valley
         item["seconds"] += seconds
         item["last"] = ts
 
     def _restore_hours(self, state: dict) -> None:
         """恢复时段分布（0~23 点各累计多少 Wh）。长度对不上一律重置。"""
-        raw = state.get("hours")
+        self._hours = self._read_hour_buckets(state.get("hours"))
+        self._hours_valley = self._read_hour_buckets(state.get("hours_valley"))
+
+    @staticmethod
+    def _read_hour_buckets(raw) -> list[float]:
         values: list[float] = []
         if isinstance(raw, list):
             values = [_num_seq(raw, i) for i in range(len(raw))]
         elif isinstance(raw, dict):
             values = [_num(raw, str(i)) for i in range(HOUR_BUCKETS)]
         if len(values) != HOUR_BUCKETS:
-            self._hours = [0.0] * HOUR_BUCKETS
-            return
-        self._hours = [max(0.0, v) for v in values]
+            # 长度不对（手改坏了 / 旧格式）就整段重置，别按位数错位对齐
+            return [0.0] * HOUR_BUCKETS
+        return [max(0.0, v) for v in values]
 
-    def _bump_hour(self, hour: int, wh: float) -> None:
+    def _bump_hour(self, hour: int, wh: float, valley_wh: float) -> None:
         """记到「几点钟」这个桶上。调用方必须已持有 ``self._lock``。"""
         if 0 <= hour < HOUR_BUCKETS:
             self._hours[hour] += wh
+            self._hours_valley[hour] += valley_wh
 
-    def _bump_day(self, day: str, wh: float, cost: float, seconds: float) -> None:
+    def _bump_day(self, day: str, wh: float, peak: float, valley: float,
+                  seconds: float) -> None:
         """把这一笔记到「那一天」头上。调用方必须已经持有 ``self._lock``。"""
         item = self._days.get(day)
         if item is None:
-            item = {"wh": 0.0, "cost": 0.0, "seconds": 0.0}
+            item = {"wh": 0.0, "peak": 0.0, "valley": 0.0, "seconds": 0.0}
             self._days[day] = item
         item["wh"] += wh
-        item["cost"] += cost
+        item["peak"] += peak
+        item["valley"] += valley
         item["seconds"] += seconds
 
     def reset_session(self) -> None:
-        """清零本次统计（保留历史总量与今日累计）。"""
+        """清零本次统计（保留每日 / 每次开机 / 时段账本与累计电量）。"""
         with self._lock:
             self._first_seen_ts = time.time()
             self._session_wh = 0.0
-            self._session_cost = 0.0
             self._peak_wh = 0.0
             self._valley_wh = 0.0
             self._peak_w = 0.0
@@ -529,43 +667,47 @@ class EnergyMeter:
         self._last_persist = now
         with self._lock:
             payload = {
+                "ledger_version": LEDGER_VERSION,
                 "power_on_ts": self._power_on_ts,
                 "first_seen_ts": self._first_seen_ts,
                 "session_wh": round(self._session_wh, 4),
-                "session_cost": round(self._session_cost, 4),
                 "peak_wh": round(self._peak_wh, 4),
                 "valley_wh": round(self._valley_wh, 4),
                 "peak_w": round(self._peak_w, 2),
                 "samples": self._samples,
                 "covered_seconds": round(self._covered_seconds, 2),
                 "today_date": self._today_date,
-                "today_wh": round(self._today_wh, 4),
-                "today_cost": round(self._today_cost, 4),
-                # 每日账本写成 [电量Wh, 电费, 统计秒数] 的紧凑数组 —— 一天 3 个数，
-                # 一年也就几 KB，比一天一个对象省一半体积。
+                # 每日账本写成 [电量Wh, 秒数, 峰电量, 谷电量] 的紧凑数组 ——
+                # 一天 4 个数、一年也就几 KB。**不存电费**：电费是电量的换算，
+                # 存下来就会出现「改了电价历史还是旧价」和「累计比本次还低」。
                 "days": {
                     day: [
                         round(item["wh"], 3),
-                        round(item["cost"], 5),
                         round(item["seconds"], 1),
+                        round(item["peak"], 3),
+                        round(item["valley"], 3),
                     ]
                     for day, item in sorted(self._days.items())[-HISTORY_DAYS:]
                 },
-                # 每次开机一条：[电量Wh, 电费, 统计秒数, 最后采样时刻]。
+                # 每次开机一条：[电量Wh, 秒数, 最后采样时刻, 峰电量, 谷电量]。
                 # 键是开机时刻，所以「同一次开机内重开程序」不会碎成多条。
                 "sessions": {
                     str(boot): [
                         round(item["wh"], 3),
-                        round(item["cost"], 5),
                         round(item["seconds"], 1),
                         round(item["last"], 1),
+                        round(item["peak"], 3),
+                        round(item["valley"], 3),
                     ]
                     for boot, item in sorted(self._sessions.items())[-HISTORY_SESSIONS:]
                 },
                 # 0~23 点各累计多少 Wh（跨所有天累加，用来找「几点最费电」）
                 "hours": [round(v, 3) for v in self._hours],
+                "hours_valley": [round(v, 3) for v in self._hours_valley],
                 "total_wh": round(self._total_wh, 4),
-                "total_cost": round(self._total_cost, 5),
+                # 全局峰谷电量：累计电费由它现算，是「累计 ≥ 本次」的结构保证
+                "total_peak_wh": round(self._total_peak_wh, 4),
+                "total_valley_wh": round(self._total_valley_wh, 4),
                 "total_sessions": self._total_sessions,
                 "curve": [
                     [round(ts, 1), round(total, 3), int(count)]
@@ -633,7 +775,8 @@ class EnergyMeter:
 
             tm = time.localtime(reading.ts)
             today = time.strftime("%Y-%m-%d", tm)
-            segment, rate = rate_at(self._cfg, tm)
+            # 只取时段名 —— 电价不在这里乘，电费一律由 blend_cost() 按电量现算
+            segment = segment_of(self._cfg, tm)
             valley = segment == "谷段"
 
             with self._lock:
@@ -641,37 +784,35 @@ class EnergyMeter:
                 self._samples += 1
                 self._peak_w = max(self._peak_w, reading.total_w)
 
-                # 跨天就换到新的「今日」桶。已经记进 days 的那天原样留着，
-                # 新的一天如果早些时候跑过程序（days 里已有）就接着累加。
+                # 跨天只更新「今天」是哪天 —— 电量本身记在 days 里，
+                # 新的一天如果没有历史条目就从 0 开始（_bump_day 会建）。
                 if today != self._today_date:
                     self._today_date = today
-                    existing = self._days.get(today)
-                    self._today_wh = existing["wh"] if existing else 0.0
-                    self._today_cost = existing["cost"] if existing else 0.0
 
                 # 只有在合理的时间步长内才积分；睡眠/挂起留下的大空档直接跳过，
                 # 免得把休眠时长乘上功率算成虚高的能耗
                 if prev_w is not None and 0.0 < dt < interval * 5:
                     energy_wh = (prev_w + reading.total_w) / 2.0 * dt / 3600.0
-                    money = energy_wh / 1000.0 * rate
+                    # 峰 / 谷电量分开记：电费是它们乘上电价现算的（见 blend_cost），
+                    # 所以电量拆得越细，改电价后重算得越准。
+                    valley_wh = energy_wh if valley else 0.0
+                    peak_wh = energy_wh if (segment == "峰段") else 0.0
 
                     self._session_wh += energy_wh
-                    self._session_cost += money
                     self._total_wh += energy_wh
-                    self._total_cost += money
-                    self._today_wh += energy_wh
-                    self._today_cost += money
                     self._covered_seconds += dt
-                    self._bump_day(today, energy_wh, money, dt)
-                    # 同一条数据同时记到「本次开机」和「几点钟」两个维度上 ——
-                    # 统计窗口的三个视图（每天 / 每次开机 / 按时段）都从这儿来。
-                    self._bump_session(reading.ts, energy_wh, money, dt)
-                    self._bump_hour(tm.tm_hour, energy_wh)
-
                     if valley:
                         self._valley_wh += energy_wh
-                    else:
+                        self._total_valley_wh += energy_wh
+                    elif segment == "峰段":
                         self._peak_wh += energy_wh
+                        self._total_peak_wh += energy_wh
+                    self._bump_day(today, energy_wh, peak_wh, valley_wh, dt)
+                    # 同一条数据同时记到「本次开机」和「几点钟」两个维度上 ——
+                    # 统计窗口的三个视图（每天 / 每次开机 / 按时段）都从这儿来。
+                    self._bump_session(reading.ts, energy_wh, peak_wh,
+                                       valley_wh, dt)
+                    self._bump_hour(tm.tm_hour, energy_wh, valley_wh)
 
                 prev_w = reading.total_w
 
@@ -687,6 +828,56 @@ class EnergyMeter:
 
     # ------------------------------------------------------------- 快照
 
+    def _day_cost(self, day: str, item: dict) -> float:
+        """一天的电费 —— 由那天的电量按当前电价现算（单价按那天的月份取丰/枯）。"""
+        return blend_cost(self._cfg, day_tm(day),
+                          item["wh"], item["peak"], item["valley"])
+
+    def _residual(self) -> tuple[float, float, float]:
+        """累计账本里**没有明细**的那部分电量（峰, 谷, 总）。
+
+        ``total_*`` 是全量累加器；每日账本有 400 天上限，更老的会被裁掉，
+        差额就是「只在累计里、不在每日里」的电量。累计电费必须把它算进去，
+        否则裁掉旧日期的那一天，累计电费会凭空掉一截。
+
+        返回永远非负：手改坏的账本不能让这里变成负电量。
+        """
+        day_wh = sum(i["wh"] for i in self._days.values())
+        day_peak = sum(i["peak"] for i in self._days.values())
+        day_valley = sum(i["valley"] for i in self._days.values())
+        return (
+            max(0.0, self._total_peak_wh - day_peak),
+            max(0.0, self._total_valley_wh - day_valley),
+            max(0.0, self._total_wh - day_wh),
+        )
+
+    def _total_cost(self) -> float:
+        """累计电费 = 每日账本的电费之和 + 无明细那部分的电费。
+
+        **不要**把它写成独立累加器 —— 那正是「累计电费比本次电费还低」的成因：
+        独立累加器可以只覆盖了历史的一部分（旧版本只存当天一个桶），
+        回填时又不知道缺的那截电价是多少，于是凭空少算。
+        """
+        cost = sum(self._day_cost(day, item) for day, item in self._days.items())
+        peak, valley, wh = self._residual()
+        now_tm = time.localtime()
+        cost += blend_cost(self._cfg, now_tm, wh, peak, valley)
+        # 上限保护：任何情况下累计都不该低于本次 / 今日（电量单调、单价同一套）
+        return max(cost, self._session_cost(), self._today_cost())
+
+    def _today_item(self) -> dict:
+        return self._days.get(self._today_key()) or {
+            "wh": 0.0, "peak": 0.0, "valley": 0.0, "seconds": 0.0,
+        }
+
+    def _today_cost(self) -> float:
+        day = self._today_key()
+        return self._day_cost(day, self._today_item())
+
+    def _session_cost(self) -> float:
+        return blend_cost(self._cfg, time.localtime(),
+                          self._session_wh, self._peak_wh, self._valley_wh)
+
     def snapshot(self) -> Snapshot:
         with self._lock:
             latest = self._latest
@@ -700,15 +891,16 @@ class EnergyMeter:
             for day, item in self._days.items():
                 if day.startswith(month):
                     month_wh += item["wh"]
-                    month_cost += item["cost"]
+                    month_cost += self._day_cost(day, item)
                     month_days += 1
             recent = [
-                (day[5:], item["wh"], item["cost"])
+                (day[5:], item["wh"], self._day_cost(day, item))
                 for day, item in sorted(self._days.items())[-7:]
             ]
+            today_item = self._today_item()
             return Snapshot(
                 session_wh=self._session_wh,
-                session_cost=self._session_cost,
+                session_cost=self._session_cost(),
                 covered_seconds=self._covered_seconds,
                 average_w=avg,
                 peak_w=self._peak_w,
@@ -723,13 +915,13 @@ class EnergyMeter:
                 in_valley=is_valley(self._cfg, now_tm),
                 segment=segment_of(self._cfg, now_tm),
                 rate=rate_at(self._cfg, now_tm)[1],
-                today_wh=self._today_wh,
-                today_cost=self._today_cost,
+                today_wh=today_item["wh"],
+                today_cost=self._today_cost(),
                 month_wh=month_wh,
                 month_cost=month_cost,
                 month_days=month_days,
                 total_wh=self._total_wh,
-                total_cost=self._total_cost,
+                total_cost=self._total_cost(),
                 total_sessions=self._total_sessions,
                 total_days=len(self._days),
                 recent_days=recent,
@@ -762,17 +954,17 @@ class EnergyMeter:
                 for day, item in self._days.items():
                     if day.startswith(prefix):
                         wh += item["wh"]
-                        cost += item["cost"]
+                        cost += self._day_cost(day, item)
                         days += 1
                 return wh, cost, days
 
             month_wh, month_cost, month_days = fold(month)
             year_wh, year_cost, year_days = fold(year)
             return {
-                "today": (self._today_wh, self._today_cost),
+                "today": (self._today_item()["wh"], self._today_cost()),
                 "month": (month_wh, month_cost),
                 "year": (year_wh, year_cost),
-                "total": (self._total_wh, self._total_cost),
+                "total": (self._total_wh, self._total_cost()),
                 "month_days": month_days,
                 "year_days": year_days,
                 "days": len(self._days),
@@ -783,8 +975,12 @@ class EnergyMeter:
         """按某个维度取明细行，**新的在前**。
 
         kind 取值：``day`` / ``month`` / ``year`` / ``session`` / ``hour``。
-        每行统一是 ``{"when", "wh", "cost", "seconds", "note"}`` —— 统计窗口只
-        认这一种形状，加维度时不用改窗口代码。
+        每行统一是 ``{"when", "wh", "cost", "seconds", "note", "key"}`` —— 统计
+        窗口只认这一种形状，加维度时不用改窗口代码。
+
+        ``key`` 是该行的**稳定标识**：按天是 ``2026-09-16``，按月是 ``2026-09``，
+        按每次开机是开机时刻的字符串。用户要「自己挑某一天/某一次开机去看」，
+        窗口靠它定位到具体那一条。
         """
         with self._lock:
             if kind == "session":
@@ -795,27 +991,41 @@ class EnergyMeter:
                     rows.append({
                         "when": time.strftime("%m-%d %H:%M", tm),
                         "wh": item["wh"],
-                        "cost": item["cost"],
+                        "cost": blend_cost(self._cfg, tm, item["wh"],
+                                           item["peak"], item["valley"]),
                         "seconds": item["seconds"],
                         # 「这次开机一共开了多久」和「统计到多久」是两回事：
                         # 程序没跑的那段测不到，但用户想知道整次开机有多长。
                         "note": "开机 " + _duration(span),
                         "day": time.strftime("%Y-%m-%d", tm),
+                        "key": str(boot),
+                        "boot": boot,
+                        "peak_wh": item["peak"],
+                        "valley_wh": item["valley"],
+                        "last": item["last"],
                     })
                 return rows[:limit]
 
             if kind == "hour":
                 total = sum(self._hours) or 0.0
+                now_tm = time.localtime()
+                v_rate = valley_rate(self._cfg, now_tm)
                 rows = []
                 for h in range(HOUR_BUCKETS):
                     wh = self._hours[h]
+                    v_wh = self._hours_valley[h]
                     share = (wh / total * 100.0) if total > 0 else 0.0
                     rows.append({
                         "when": f"{h:02d}:00 – {h + 1:02d}:00",
                         "wh": wh,
-                        "cost": wh / 1000.0 * self._cfg.price_flat,
+                        # 时段桶只拆了峰谷（没有日期），谷价按**当前月份**取 ——
+                        # 跨了丰枯的话这一列会有一点偏差，列头已注明是估算。
+                        "cost": blend_cost(self._cfg, now_tm, wh, 0.0, v_wh),
                         "seconds": 0.0,
                         "note": f"占 {share:.1f}%" if wh > 0 else "—",
+                        "key": f"{h:02d}",
+                        "peak_wh": 0.0,
+                        "valley_wh": v_wh,
                     })
                 return rows[:limit]
 
@@ -827,11 +1037,14 @@ class EnergyMeter:
                     rows.append({
                         "when": f"{day} {WEEKDAYS[tm.tm_wday]}",
                         "wh": item["wh"],
-                        "cost": item["cost"],
+                        "cost": self._day_cost(day, item),
                         "seconds": item["seconds"],
                         "note": f"开机 {launched.get(day, 0)} 次"
                                 if launched.get(day) else "—",
                         "day": day,
+                        "key": day,
+                        "peak_wh": item["peak"],
+                        "valley_wh": item["valley"],
                     })
                 return rows[:limit]
 
@@ -841,10 +1054,15 @@ class EnergyMeter:
                 for day, item in self._days.items():
                     key = day[:width]
                     acc = groups.setdefault(key, {"wh": 0.0, "cost": 0.0,
-                                                  "seconds": 0.0, "days": 0.0})
+                                                  "seconds": 0.0, "days": 0.0,
+                                                  "peak": 0.0, "valley": 0.0})
                     acc["wh"] += item["wh"]
-                    acc["cost"] += item["cost"]
+                    # 电费按**天**累加而不是把整月的电量按一个单价算 ——
+                    # 跨丰枯水期时只有逐天算才对得上。
+                    acc["cost"] += self._day_cost(day, item)
                     acc["seconds"] += item["seconds"]
+                    acc["peak"] += item["peak"]
+                    acc["valley"] += item["valley"]
                     acc["days"] += 1
                 rows = []
                 for key, acc in sorted(groups.items(), reverse=True):
@@ -857,6 +1075,9 @@ class EnergyMeter:
                         "seconds": acc["seconds"],
                         "note": f"{days} 天 · 日均 {avg / 1000:.2f} kWh",
                         "day": key,
+                        "key": key,
+                        "peak_wh": acc["peak"],
+                        "valley_wh": acc["valley"],
                     })
                 return rows[:limit]
 
@@ -889,8 +1110,12 @@ class EnergyMeter:
 __all__ = [
     "EnergyMeter",
     "Snapshot",
+    "blend_cost",
+    "day_tm",
     "is_valley",
     "rate_at",
     "segment_of",
+    "split_by_ratio",
     "valley_price",
+    "valley_rate",
 ]

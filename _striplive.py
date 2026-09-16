@@ -95,6 +95,73 @@ def make_snapshot(cfg, now: float, **overrides) -> Snapshot:
     return Snapshot(**base)
 
 
+def check_alignment(strip) -> int:
+    """在**真实渲染出来的像素**上验「两排对齐」和「拖动把手」。
+
+    为什么还要在像素上验一遍：`_stripfields_test.py` 验的是「绘制调用的 x」，
+    那是源码层的账；这里是渲染结果本身 —— 如果 alpha 合成、抠色、或者别的什么
+    把画面挪了位，只有看像素才发现。分隔线是纯色实心 1px 竖条，正好当标尺用。
+    """
+    bad = 0
+    view, pal = strip._view, strip._pal
+    if view is None or pal is None:
+        print("[SKIP] 没有渲染结果，跳过像素级校验")
+        return 0
+    w, h = strip._w, strip._h
+    # ⚠️ pal 里存的是 COLORREF（低字节是 **R**，不是 B）；DIB 是 BGRA。
+    # 这两个顺序搞反过一次，结果「一条分隔线都没找到」，而空集合让对齐断言
+    # 恒真 —— 看着 PASS，其实什么都没验。所以下面还专门挡一句「一个都没找到」。
+    div = pal["div"]
+    dr, dg, db = div & 0xFF, (div >> 8) & 0xFF, (div >> 16) & 0xFF
+    rows = strip._plan_rows
+    content_h = strip._plan_height
+    band_top = (h - content_h) / 2.0
+    row_h = content_h / max(1, rows)
+
+    def is_div(x, y):
+        i = (y * w + x) * 4
+        return view[i] == db and view[i + 1] == dg and view[i + 2] == dr
+
+    found = []
+    for i in range(rows):
+        y0 = int(band_top + row_h * i + row_h * 0.28)
+        y1 = max(y0 + 2, int(band_top + row_h * i + row_h * 0.72))
+        found.append([x for x in range(w)
+                      if all(is_div(x, y) for y in range(y0, y1))])
+
+    print(f"像素级：{rows} 行，分隔线 x = {found}")
+    if not any(found):
+        bad += 1
+        print("[FAIL] 一条分隔线都没在像素里找到（判据本身失效，别当成通过）")
+    elif rows < 2:
+        print("[SKIP] 只有一行，没有「两排」可比")
+    elif all(f == found[0][:len(f)] for f in found[1:]):
+        print("[PASS] 两行的分隔线在同一批 x 上（像素级对齐）")
+    else:
+        bad += 1
+        print("[FAIL] 两行的分隔线不在同一批 x 上")
+
+    # 把手：建出来两块，而且真的能点到（命中测试按像素 alpha 走，见 strip._grip_paint）
+    grips = list(strip._grip_hwnds)
+    if len(grips) != 2:
+        bad += 1
+        print(f"[FAIL] 拖动把手应为 2 块，实际 {len(grips)}")
+        return bad
+    hit = 0
+    for hwnd in grips:
+        r = w32.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        pt = w32.wintypes.POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        if user32.WindowFromPoint(pt) == hwnd:
+            hit += 1
+    if hit == 2:
+        print("[PASS] 两块把手都能被鼠标点到（WindowFromPoint 命中）")
+    else:
+        bad += 1
+        print(f"[FAIL] 只有 {hit}/2 块把手能被点到")
+    return bad
+
+
 def main() -> int:
     enable_dpi_awareness()
     argv = sys.argv[1:]
@@ -106,6 +173,9 @@ def main() -> int:
 
     cfg = Config()
     cfg.strip_enabled = True
+    # 像素级校验要拿分隔线的**原色**去比对，所以固定用不透明质感
+    # （玻璃/深色卡片会把 RGB 按 alpha 预乘，颜色对不上就假报错误）
+    cfg.strip_theme = "auto"
     if fields == "all":
         cfg.strip_fields = list(stripopts.FIELD_KEYS)
     elif fields:
@@ -139,9 +209,10 @@ def main() -> int:
         r = wintypes_rect(strip.hwnd)
         print(f"长条实际窗口矩形 = {r}  排了 {strip._plan_rows} 行 "
               f"（计划高 {strip._plan_height}px，圆角 {strip._radius:.1f}）")
+    bad = check_alignment(strip)
     strip.destroy()
     print("已销毁")
-    return 0
+    return 1 if bad else 0
 
 
 def wintypes_rect(hwnd):

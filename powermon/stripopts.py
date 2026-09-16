@@ -103,6 +103,13 @@ SHORT_LABEL = {
     "total_cost": "累计",
 }
 
+# ------------------------------------------------------------------ 拖动
+# 长条横向可以拖（两端有把手，见 strip.py）。拖动量存成「设计基准像素」——
+# 48px 任务栏下的像素，跟 DPI 缩放走，换屏 / 改缩放后位置依然合理。
+# 这是允许的绝对值上限：再大也只是「拖到屏幕最左/最右」，`strip._target_rect`
+# 里还会按实际可用区域再夹一次。放这么宽是因为它只管「配置别被手改写坏」。
+OFFSET_LIMIT = 4000.0
+
 
 # ------------------------------------------------------------------ 取值
 
@@ -152,6 +159,24 @@ def enabled_fields(cfg) -> list[str]:
             if k in FIELD_KEYS and k not in keys:
                 keys.append(k)
     return keys or list(DEFAULT_FIELDS)
+
+
+def grip_enabled(cfg) -> bool:
+    """长条两端要不要留拖动把手。
+
+    默认开 —— 没有把手就拖不动长条（长条本体是穿透点击的，收不到鼠标）。
+    """
+    value = getattr(cfg, "strip_grip", True)
+    return bool(value) if isinstance(value, (bool, int)) else True
+
+
+def offset_x(cfg) -> float:
+    """用户拖出来的横向偏移（设计基准像素）。"""
+    try:
+        value = float(getattr(cfg, "strip_offset_x", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-OFFSET_LIMIT, min(OFFSET_LIMIT, value))
 
 
 def _energy(wh: float) -> tuple[str, str]:
@@ -259,6 +284,19 @@ def sanitize(cfg) -> bool:
     keys = enabled_fields(cfg)
     if not isinstance(raw, (list, tuple)) or list(raw) != keys:
         cfg.strip_fields = keys
+        changed = True
+
+    # 拖动把手开关 / 拖动量：手改 config.json 写成 "1e9" 之类会让长条飞到天边，
+    # 统一在这儿夹回合法值（真正的边界在 strip._target_rect 里按屏幕再夹一次）。
+    raw_grip = getattr(cfg, "strip_grip", True)
+    if not isinstance(raw_grip, bool):
+        cfg.strip_grip = bool(raw_grip)
+        changed = True
+
+    raw_offset = getattr(cfg, "strip_offset_x", 0.0)
+    fixed_offset = offset_x(cfg)
+    if raw_offset != fixed_offset:
+        cfg.strip_offset_x = fixed_offset
         changed = True
 
     return changed

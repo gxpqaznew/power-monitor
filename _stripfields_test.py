@@ -93,6 +93,46 @@ class SpyStrip(TaskbarStrip):
         return plan
 
 
+class DrawSpy(TaskbarStrip):
+    """记录一次**真实绘制**里每段文字画在哪个 x、每条分隔线画在哪个 x。
+
+    折行之后唯一能证明「两排对齐」的东西就是这些 x：标签的起点、分隔线的位置
+    都必须只由「列」决定，和行号无关。逻辑层（``_plan`` 返回的行/列结构）看着
+    完全正常，可只要绘制那边各排各的，两排就是歪的 —— 所以这一条必须在绘制
+    路径上验，不能在计划上验。
+    """
+
+    def __init__(self, cfg) -> None:
+        super().__init__(cfg)
+        self.calls: list[tuple] = []
+
+    def _text(self, dc, text, x, y, w, h, font, color, align=0):
+        self.calls.append(("text", text, int(round(x)), int(round(y)), color))
+        return super()._text(dc, text, x, y, w, h, font, color, align)
+
+    def _fill(self, dc, x, y, w, h, color):
+        self.calls.append(("fill", int(round(x)), int(round(y)), int(w), int(h)))
+        return super()._fill(dc, x, y, w, h, color)
+
+    # ---- 分析 ----
+
+    def rows_of(self, color) -> list[list[int]]:
+        """某一种颜色（标签 / 数值 / 单位）的文字，按行分组后的 x 列表。"""
+        by_y: dict[int, list[int]] = {}
+        for kind, text, x, y, col in self.calls:
+            if kind == "text" and col == color:
+                by_y.setdefault(y, []).append(x)
+        return [by_y[y] for y in sorted(by_y)]
+
+    def dividers(self) -> dict[int, list[int]]:
+        """分隔线（细窄的竖条）按 y 分组的 x 列表。"""
+        by_y: dict[int, list[int]] = {}
+        for kind, x, y, w, h in self.calls:
+            if kind == "fill" and w <= 2 and h > 2 and h < 200:
+                by_y.setdefault(y, []).append(x)
+        return {y: sorted(v) for y, v in by_y.items()}
+
+
 def main() -> int:
     cfg = Config()
     cfg.strip_fields = list(stripopts.FIELD_KEYS)      # 15 项全勾
@@ -179,6 +219,42 @@ def main() -> int:
                   got["placed"] == got["total"] == n,
                   f"{got['placed']}/{got['total']}，{got['rows']} 行，"
                   f"密度 {got['density']}，字号 {got['font_scale']}")
+
+        # ---- 两排对齐：折行之后必须排成「表格」，不能各排各的 ----
+        # 用户的反馈是「第一排和第二排都没对齐，导致看起来很没有质感」。这一条
+        # 只能在**绘制路径**上验：量每一段文字的实际 x（按颜色区分标签/数值/单位），
+        # 两行里同一列必须落在同一个 x 上，分隔线同理。
+        spy = DrawSpy(cfg)
+        spy.cfg.strip_theme = "auto"
+        for n in (6, 8, 10, 12, 15):
+            spy.cfg.strip_fields = list(stripopts.FIELD_KEYS)[:n]
+            spy._limit = REAL_AVAILABLE
+            spy._max_height = budget
+            spy.calls = []
+            _w, canvas_h, pal = spy._layout(dc, scale, snap, render=True,
+                                            height=int(round(bar_h * 0.94)))
+            if pal is None:
+                check(f"勾 {n:>2} 项：绘制路径能拿到配色（对齐检查的前提）", False)
+                continue
+            label_rows = spy.rows_of(pal["dim"])
+            value_rows = spy.rows_of(pal["ink"])
+            if len(label_rows) < 2:
+                # 这一档单行就排下了，没有「两排」可比 —— 跳过（上面已经验过单行）
+                continue
+            first = label_rows[0]
+            ok = all(len(r) >= 1 and r == first[:len(r)] for r in label_rows[1:])
+            check(f"勾 {n:>2} 项：{len(label_rows)} 行的标签 x 逐列重合（列对齐）",
+                  ok, f"{label_rows}")
+            ok_v = all(r == value_rows[0][:len(r)] for r in value_rows[1:])
+            check(f"勾 {n:>2} 项：{len(label_rows)} 行的数值 x 逐列重合",
+                  ok_v, f"{value_rows}")
+            divs = spy.dividers()
+            keys = sorted(divs)
+            ok_d = len(keys) >= 2 and all(
+                divs[k] == divs[keys[0]][:len(divs[k])] for k in keys[1:]
+            )
+            check(f"勾 {n:>2} 项：{len(keys)} 条分隔线的 x 逐列重合（竖线对齐）",
+                  ok_d, f"{ {k: v for k, v in divs.items()} }")
 
         # ---- 可用宽度变窄时：允许少显示，但不能整条消失或排成一大坨 ----
         for available in (700, 560, 420, 300):

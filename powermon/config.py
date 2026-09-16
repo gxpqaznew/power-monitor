@@ -270,6 +270,13 @@ class Config:
     strip_fields: list = field(
         default_factory=lambda: ["current", "cost", "session", "today"]
     )
+    # 长条能不能拖：两端各留一块 15px 的「把手」（两列小圆点），按住横着拖，
+    # 双击把手 = 回到默认位置。长条本体是穿透点击的（不能吃掉任务栏的右键菜单），
+    # 所以拖动只能挂在这两块把手上。关掉把手就彻底拖不动了。
+    strip_grip: bool = True
+    # 用户拖出来的横向偏移，单位是「设计基准像素」（48px 任务栏下的像素 ×
+    # 缩放系数还原），所以换 DPI / 改任务栏高度之后位置依然合理。
+    strip_offset_x: float = 0.0
 
     # ---- 整机口径 ----
     # 是否把显示器功耗计入（显示器一般独立计量，默认不计）

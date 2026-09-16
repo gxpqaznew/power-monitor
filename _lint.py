@@ -8,6 +8,11 @@
 v1.0.6 首次发布时收尾段落里就留着这么一句 `Delete "${LEGACY_DIR}\\state.json"`，
 把用户刚攒下的 3605 Wh 账本删了个干净 —— 装一次丢一次，而且现象正好是
 「更新之后记录全没了」，跟这一版想修的问题长得一模一样，很难第一眼认出来。
+
+第三、四项是「拖动把手」的两条线（见文件末尾），也是实测踩出来的：
+把手带 `WS_EX_TRANSPARENT` 就收不到鼠标；把手位图不垫非 0 alpha 的话，
+鼠标会从 alpha=0 的像素上穿过去 —— 两种失效都**不影响编译、也不影响截图**，
+只有真的去问系统「这一点上是哪个窗口」才看得出来。
 """
 
 import ast
@@ -78,6 +83,28 @@ for path in sorted(ROOT.glob("*.py")):
             problems += 1
             print(f"{path.name}:{lineno}: CreateWindowExW 第一个参数疑似窗口样式 "
                   f"（窗口样式位在扩展样式里是别的含义）-> {stripped}")
+
+# ---- 拖动把手的两条保命线 ----
+# 1) 把手**不能**带 WS_EX_TRANSPARENT：带了就是穿透点击，收不到鼠标，「拖动」直接
+#    失效（而且失效得很安静 —— 窗口看着好好的，就是抓不住）。
+# 2) 把手的位图必须垫一层非 0 的 alpha：分层窗口（UpdateLayeredWindow）的命中测试
+#    按像素 alpha 走，alpha=0 的地方鼠标会穿过去。踩过一次：只有圆点那几像素能点到，
+#    其余位置 WindowFromPoint 返回 Shell_TrayWnd。
+STRIP = ROOT / "strip.py"
+_strip_src = STRIP.read_text(encoding="utf-8")
+if "_grip_create" in _strip_src:
+    grip_block = _strip_src.split("def _grip_create", 1)[1].split("\n    def ", 1)[0]
+    for lineno, line in enumerate(grip_block.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#") or "ex = " not in stripped:
+            continue
+        if "TRANSPARENT" in stripped:
+            problems += 1
+            print(f"strip.py（_grip_create 内）: 拖动把手带了 WS_EX_TRANSPARENT "
+                  f"→ 收不到鼠标，拖不动 -> {stripped}")
+    if "_GRIP_HIT_ALPHA" not in _strip_src:
+        problems += 1
+        print("strip.py: 把手位图没有垫命中用的 alpha（alpha=0 的地方鼠标会穿过去）")
 
 print("OK" if not problems else f"发现 {problems} 处可疑")
 sys.exit(1 if problems else 0)

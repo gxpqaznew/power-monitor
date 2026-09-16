@@ -23,15 +23,25 @@
 from __future__ import annotations
 
 import ctypes
+import time
 
 from . import debug
 from .meter import _duration as _short_time
 from .w32 import (
     BN_CLICKED,
     BS_PUSHBUTTON,
+    CB_ADDSTRING,
+    CB_GETCURSEL,
+    CB_RESETCONTENT,
+    CB_SETCURSEL,
+    CBN_SELCHANGE,
+    CBS_DROPDOWNLIST,
     CLEARTYPE_QUALITY,
     COLOR_BTNFACE,
     DEFAULT_CHARSET,
+    ES_AUTOVSCROLL,
+    ES_MULTILINE,
+    ES_READONLY,
     FW_BOLD,
     FW_NORMAL,
     HWND_NOTOPMOST,
@@ -47,6 +57,7 @@ from .w32 import (
     TRANSPARENT,
     WM_CLOSE,
     WM_COMMAND,
+    WM_CTLCOLOREDIT,
     WM_CTLCOLORSTATIC,
     WM_DESTROY,
     WM_NOTIFY,
@@ -61,8 +72,10 @@ from .w32 import (
     WS_EX_CLIENTEDGE,
     WS_OVERLAPPED,
     WS_SYSMENU,
+    WS_TABSTOP,
     WS_THICKFRAME,
     WS_VISIBLE,
+    WS_VSCROLL,
     gdi32,
     kernel32,
     user32,
@@ -82,6 +95,12 @@ IDC_LIST = 201
 IDC_SUMMARY = 202
 IDC_REFRESH = 203
 IDC_HINT = 204
+# 「自己挑一条看」的选择器：下拉 + 前后翻，配一个只读明细框
+IDC_PICK = 205
+IDC_PREV = 206
+IDC_NEXT = 207
+IDC_DETAIL = 208
+IDC_PICKLABEL = 209
 
 # --------------------------------------------------------------------- 常量
 # 这些不是 w32 里的公共常量（只有本窗口用），就近定义，避免把 w32 撑成杂物间。
@@ -109,6 +128,17 @@ LVM_SETEXTENDEDLISTVIEWSTYLE = LVM_FIRST + 54
 LVM_GETITEMCOUNT = LVM_FIRST + 4
 # 读回用：自检要拿它验「设进去的文字真的进了控件」，而不是设了个野指针
 LVM_GETITEMTEXTW = LVM_FIRST + 115
+# 选中同步：点表格某一行 → 明细跟着换
+LVM_GETNEXTITEM = LVM_FIRST + 12
+LVM_SETITEMSTATE = LVM_FIRST + 43
+LVM_ENSUREVISIBLE = LVM_FIRST + 19
+LVNI_SELECTED = 0x0002
+LVIS_SELECTED = 0x0002
+LVIS_FOCUSED = 0x0001
+LVIS_STATEIMAGEMASK = 0xF000
+
+LVN_FIRST = -100
+LVN_ITEMCHANGED = LVN_FIRST - 1
 
 LVS_REPORT = 0x0001
 LVS_SINGLESEL = 0x0004
@@ -279,8 +309,14 @@ class StatsWindow:
         self.scale = 1.0
         # 宽一点是为了底部那条汇总能放下「今天 / 本月 / 今年 / 累计」四组；
         # 窄了也不崩（_fit_groups 会按重要性丢组），只是少看到一两组。
+        # 多出来的高度留给「选择器 + 明细框」，这样点一条就能看到它的全部数字。
         self.client_w = 800
-        self.client_h = 540
+        self.client_h = 620
+        # 当前分页的行（表格与下拉共用同一份，顺序也一致）
+        self._rows: list[dict] = []
+        self._kind = TABS[0][0]
+        # 灌数据时会触发 LVN_ITEMCHANGED，用一个标志避免「自己触发自己」递归
+        self._filling = False
 
     # ------------------------------------------------------------- 尺寸
 
@@ -394,6 +430,16 @@ class StatsWindow:
         list_style = (LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS)
         self._child(LIST_CLASS, "", list_style, IDC_LIST, "body",
                     ex=WS_EX_CLIENTEDGE)
+        # 「自己挑一条看」的选择器。用户的原话是「你这样对用户来说还是一个黑箱」——
+        # 一张只能从头看到尾的表不等于能查，得让人直接指名道姓地挑。
+        self._child("STATIC", "选一天", SS_LEFT, IDC_PICKLABEL, "body")
+        self._child("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+                    IDC_PICK, "body")
+        self._child("BUTTON", "◀", BS_PUSHBUTTON, IDC_PREV, "body")
+        self._child("BUTTON", "▶", BS_PUSHBUTTON, IDC_NEXT, "body")
+        detail_style = (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL)
+        self._child("EDIT", "", detail_style, IDC_DETAIL, "body",
+                    ex=WS_EX_CLIENTEDGE)
         self._child("STATIC", "", SS_LEFT, IDC_SUMMARY, "body")
         self._child("STATIC", "", SS_LEFT, IDC_HINT, "small")
         self._child("BUTTON", "刷新", BS_PUSHBUTTON, IDC_REFRESH, "body")
@@ -446,11 +492,14 @@ class StatsWindow:
         tab_h = self.s(28)
         btn_w = self.s(64)
         btn_h = self.s(24)
+        pick_w = self.s(30)
         # 底部两条**各占一行**：汇总一条、说明一条。都按控件宽度截断，
         # 不做自动换行 —— STATIC 换行时第二行会盖到下面那条上（第一版就是这样，
         # 截图里「48.37 | 已记录 45 天」被压掉了一半）。
         sum_h = self.s(21)
         hint_h = self.s(19)
+        # 明细框固定 5 行高：够写「电量/电费/时长/峰平谷/开机次数」，再多就没人看
+        detail_h = self.s(92)
         gap = self.s(5)
 
         self._move(IDC_TAB, margin, margin,
@@ -459,13 +508,30 @@ class StatsWindow:
         # 四组数字，把按钮挤在汇总行右边的话宽度就不够，四组会掉到三组。
         self._move(IDC_REFRESH, w - margin - btn_w,
                    margin + (tab_h - btn_h) // 2, btn_w, btn_h)
-        top = margin + tab_h + self.s(6)
-        bottom = sum_h + hint_h + gap * 2 + self.s(4)
+
+        pick_y = margin + tab_h + self.s(6)
+        label_w = self.s(56)
+        pick_x = margin + label_w
+        # 下拉框的「高度」参数里包含了展开后的列表高度，所以给大一点，
+        # 否则展开只看得见两三条（COMBOBOX 的老规矩）。
+        self._move(IDC_PICKLABEL, margin, pick_y + self.s(4), label_w, btn_h)
+        combo_right = w - margin - (pick_w + self.s(4)) * 2
+        self._move(IDC_PICK, pick_x, pick_y,
+                   max(self.s(80), combo_right - pick_x), btn_h + self.s(220))
+        self._move(IDC_PREV, combo_right + self.s(4), pick_y, pick_w, btn_h)
+        self._move(IDC_NEXT, combo_right + self.s(4) * 2 + pick_w, pick_y,
+                   pick_w, btn_h)
+
+        top = pick_y + btn_h + self.s(6)
+        bottom = detail_h + sum_h + hint_h + gap * 3 + self.s(6)
         list_h = max(self.s(60), h - top - bottom - margin)
         self._move(IDC_LIST, margin + self.s(4), top,
                    max(10, w - 2 * margin - self.s(8)), list_h)
 
-        sum_y = top + list_h + gap
+        detail_y = top + list_h + gap
+        self._move(IDC_DETAIL, margin, detail_y,
+                   max(10, w - 2 * margin), detail_h)
+        sum_y = detail_y + detail_h + gap
         self._move(IDC_SUMMARY, margin, sum_y,
                    max(10, w - 2 * margin), sum_h)
         self._move(IDC_HINT, margin, sum_y + sum_h + gap,
@@ -530,25 +596,161 @@ class StatsWindow:
         return TABS[index][0]
 
     def refresh(self) -> None:
-        """重填表格与汇总行。切 Tab、点刷新、打开窗口时调。"""
+        """重填表格、选择器与汇总行。切 Tab、点刷新、打开窗口时调。"""
         if not self._hwnd:
             return
         try:
             totals = self.meter.stats_totals()
-            rows = self.meter.stats_rows(self._current_kind(), MAX_ROWS)
+            self._kind = self._current_kind()
+            rows = self.meter.stats_rows(self._kind, MAX_ROWS)
         except Exception as exc:  # noqa: BLE001 - 统计失败不该让窗口消失
             _dbg(f"refresh 失败: {exc!r}")
             return
+        self._rows = rows
         self._fill_rows(rows)
+        self._fill_pick(rows)
         # 只存「完整」的分组，真正设进控件的是按当前宽度截断后的版本
         # （见 _apply_texts / _fit_groups）
         self._summary_groups = self._summary_groups_for(totals)
+        # 底部只有一行文字，三组内容按**重要性**排（数字大的先留，见 _fit_groups）：
+        #   ① 怎么用明细（点一行 / 选择器）—— 这是「不再黑箱」的入口，最该留；
+        #   ② 账本口径（保留多久）—— 用户核对历史时的前提；
+        #   ③ 已记录多少天 / 多少次 —— 最次要，挤不下就先丢它。
         self._hint_groups = (
-            (f"已记录 {totals['days']} 天 · {totals['sessions']} 次开机", 3),
-            ("只统计本程序运行期间；账本保留最近 400 天 / 240 次开机", 4),
+            ("点表格任意一行 = 下面就是那一条的全部数字（也可用上面的选择器）", 6),
+            ("账本保留最近 400 天 / 240 次开机", 5),
+            (f"已记录 {totals['days']} 天 · {totals['sessions']} 次开机", 4),
         )
         self._layout()
-        _dbg(f"刷新 {len(rows)} 行（{self._current_kind()}）")
+        # 默认选中最新那一条（表格第一行），明细区立刻有内容 ——
+        # 打开就是「黑箱」的最大来源：表格有数据但没人告诉你该看哪一行。
+        self._select_index(0, sync_pick=True)
+        _dbg(f"刷新 {len(rows)} 行（{self._kind}）")
+
+    # --------------------------------------------------- 选择器与明细
+
+    def _pick_label(self, row: dict) -> str:
+        """下拉框里那一条的文字：看得到时间 + 电量，不用点进去猜。"""
+        cur = getattr(self.cfg, "currency", "\u00a5")
+        return (f"{row.get('when', '')}    {_energy(row.get('wh', 0.0))}"
+                f" · {cur}{row.get('cost', 0.0):.2f}")
+
+    def _pick_title(self) -> str:
+        return {"day": "选一天", "month": "选一个月", "year": "选一年",
+                "session": "选一次开机", "hour": "选一个时段"}.get(
+                    self._kind, "选一条")
+
+    def _fill_pick(self, rows: list[dict]) -> None:
+        """把当前分页的行灌进下拉框（顺序与表格一致：新的在前）。"""
+        combo = self._controls.get(IDC_PICK)
+        if not combo:
+            return
+        self._set_text(IDC_PICKLABEL, self._pick_title())
+        user32.SendMessageW(combo, WM_SETREDRAW, 0, 0)
+        user32.SendMessageW(combo, CB_RESETCONTENT, 0, 0)
+        for row in rows:
+            text = self._pick_label(row)
+            buf = ctypes.c_wchar_p(text)     # 必须活过 SendMessage，见 _send_text
+            user32.SendMessageW(
+                combo, CB_ADDSTRING, 0,
+                ctypes.cast(buf, ctypes.c_void_p).value,
+            )
+        user32.SendMessageW(combo, WM_SETREDRAW, 1, 0)
+        user32.InvalidateRect(combo, None, True)
+
+    def _selected_index(self) -> int:
+        combo = self._controls.get(IDC_PICK)
+        if not combo:
+            return -1
+        index = int(user32.SendMessageW(combo, CB_GETCURSEL, 0, 0))
+        return index if 0 <= index < len(self._rows) else -1
+
+    def _select_index(self, index: int, sync_pick: bool = True) -> None:
+        """选中第 index 条：同步表格高亮、下拉框、明细框。"""
+        if not self._rows:
+            self._set_text(IDC_DETAIL, "还没有可看的记录 —— 程序跑一会儿就会有了。")
+            return
+        index = max(0, min(index, len(self._rows) - 1))
+        listview = self._controls.get(IDC_LIST)
+        if listview:
+            # LVM_SETITEMSTATE 要的是 LVITEM 指针；state 在 stateMask 里的位、
+            # stateMask 写想要的位 —— 只给 SELECTED 不给 FOCUSED 会出现
+            # 「高亮在 A、焦点框在 B」的双选中怪相。
+            item = LVITEMW()
+            item.stateMask = LVIS_SELECTED | LVIS_FOCUSED
+            item.state = LVIS_SELECTED | LVIS_FOCUSED
+            item.iItem = index
+            self._filling = True
+            try:
+                user32.SendMessageW(listview, LVM_SETITEMSTATE, index,
+                                    ctypes.addressof(item))
+                user32.SendMessageW(listview, LVM_ENSUREVISIBLE, index, 0)
+            except Exception as exc:  # noqa: BLE001
+                _dbg(f"选中行失败: {exc!r}")
+            finally:
+                self._filling = False
+        if sync_pick:
+            combo = self._controls.get(IDC_PICK)
+            if combo:
+                user32.SendMessageW(combo, CB_SETCURSEL, index, 0)
+        self._set_text(IDC_DETAIL, self._detail_text(self._rows[index]))
+
+    def _step(self, delta: int) -> None:
+        index = self._selected_index()
+        if index < 0:
+            index = 0
+        else:
+            index += delta
+        self._select_index(index, sync_pick=True)
+
+    def _detail_text(self, row: dict) -> str:
+        """选中那一条的完整数字。这是「不是黑箱」的落点。"""
+        cur = getattr(self.cfg, "currency", "\u00a5")
+        wh = float(row.get("wh", 0.0))
+        peak = float(row.get("peak_wh", 0.0))
+        valley = float(row.get("valley_wh", 0.0))
+        flat = max(0.0, wh - peak - valley)
+        secs = float(row.get("seconds", 0.0))
+        avg_w = (wh * 3600.0 / secs) if secs > 0 else 0.0
+        lines: list[str] = []
+
+        if self._kind == "session":
+            boot = row.get("boot")
+            last = row.get("last")
+            lines.append(f"本次开机时刻  {_stamp(boot)}")
+            if boot and last:
+                lines.append(f"开机持续      {_short_time(last - boot)}"
+                             f"    程序统计到  {_short_time(secs)}")
+            lines.append(f"这一段用电    {_energy(wh)}    {cur}{row.get('cost', 0.0):.2f}")
+            if avg_w > 0:
+                lines.append(f"该段平均功率  {avg_w:.0f} W")
+            lines.append(f"峰段 {_energy(peak)}   平段 {_energy(flat)}"
+                         f"   谷段 {_energy(valley)}")
+        elif self._kind == "hour":
+            lines.append(f"时段          {row.get('when', '')}")
+            lines.append(f"累计用电      {_energy(wh)}    {cur}{row.get('cost', 0.0):.2f}"
+                         "（谷价按当前月份估算）")
+            lines.append(f"{row.get('note', '')}")
+            lines.append(f"其中谷段电量  {_energy(valley)}")
+        elif self._kind == "day":
+            lines.append(f"日期          {row.get('when', '')}")
+            lines.append(f"当天用电      {_energy(wh)}    {cur}{row.get('cost', 0.0):.2f}")
+            lines.append(f"当天开机次数  {row.get('note', '')}")
+            if secs > 0:
+                lines.append(f"程序统计到    {_short_time(secs)}"
+                             f"    平均 {avg_w:.0f} W")
+            lines.append(f"峰段 {_energy(peak)}   平段 {_energy(flat)}"
+                         f"   谷段 {_energy(valley)}")
+        else:  # month / year
+            unit = "一个月" if self._kind == "month" else "一年"
+            lines.append(f"{unit}        {row.get('when', '')}")
+            lines.append(f"合计用电      {_energy(wh)}    {cur}{row.get('cost', 0.0):.2f}")
+            lines.append(f"覆盖天数      {row.get('note', '')}")
+            if secs > 0:
+                lines.append(f"程序统计到    {_short_time(secs)}")
+        lines.append(f"峰段 {_energy(peak)}   平段 {_energy(flat)}"
+                     f"   谷段 {_energy(valley)}")
+        return "\r\n".join(lines)
 
     def _summary_groups_for(self, totals: dict) -> list[tuple[str, int]]:
         """汇总行的分组 + 保留优先级（数字越大越不该被丢）。
@@ -574,38 +776,44 @@ class StatsWindow:
         if not listview:
             return
         self._ensure_columns()
-        user32.SendMessageW(listview, WM_SETREDRAW, 0, 0)
-        user32.SendMessageW(listview, LVM_DELETEALLITEMS, 0, 0)
-        cur = getattr(self.cfg, "currency", "\u00a5")
-        for index, row in enumerate(rows):
-            cells = (
-                str(row.get("when", "")),
-                _energy(row.get("wh", 0.0)),
-                f"{cur}{row.get('cost', 0.0):.2f}",
-                _short_time(row.get("seconds", 0.0))
-                if row.get("seconds") else "—",
-                str(row.get("note", "") or ""),
-            )
-            # 第一列随 LVM_INSERTITEMW 一起给，其余列再 LVM_SETITEMTEXTW
-            for sub, text in enumerate(cells):
-                item = LVITEMW()
-                if sub == 0:
-                    item.mask = LVIF_TEXT
-                    item.iItem = index
-                    item.iSubItem = 0
-                    item.pszText = cells[0]
-                    item.cchTextMax = len(cells[0])
-                    _send_text(listview, LVM_INSERTITEMW, 0, item)
-                else:
-                    item.mask = LVIF_TEXT
-                    item.iItem = index
-                    item.iSubItem = sub
-                    item.pszText = text
-                    item.cchTextMax = len(text)
-                    _send_text(listview, LVM_SETITEMTEXTW, index, item)
-        user32.SendMessageW(listview, WM_SETREDRAW, 1, 0)
-        # 关掉重绘后必须手动重画一次，否则内容要等下一次窗口失效才出现
-        user32.InvalidateRect(listview, None, True)
+        # 灌数据期间每次插入都会发一条 LVN_ITEMCHANGED（选中态在变），不挡掉的话
+        # 每行都白跑一次「刷新明细」，几百行就是几百次无谓的开销。
+        self._filling = True
+        try:
+            user32.SendMessageW(listview, WM_SETREDRAW, 0, 0)
+            user32.SendMessageW(listview, LVM_DELETEALLITEMS, 0, 0)
+            cur = getattr(self.cfg, "currency", "\u00a5")
+            for index, row in enumerate(rows):
+                cells = (
+                    str(row.get("when", "")),
+                    _energy(row.get("wh", 0.0)),
+                    f"{cur}{row.get('cost', 0.0):.2f}",
+                    _short_time(row.get("seconds", 0.0))
+                    if row.get("seconds") else "—",
+                    str(row.get("note", "") or ""),
+                )
+                # 第一列随 LVM_INSERTITEMW 一起给，其余列再 LVM_SETITEMTEXTW
+                for sub, text in enumerate(cells):
+                    item = LVITEMW()
+                    if sub == 0:
+                        item.mask = LVIF_TEXT
+                        item.iItem = index
+                        item.iSubItem = 0
+                        item.pszText = cells[0]
+                        item.cchTextMax = len(cells[0])
+                        _send_text(listview, LVM_INSERTITEMW, 0, item)
+                    else:
+                        item.mask = LVIF_TEXT
+                        item.iItem = index
+                        item.iSubItem = sub
+                        item.pszText = text
+                        item.cchTextMax = len(text)
+                        _send_text(listview, LVM_SETITEMTEXTW, index, item)
+            user32.SendMessageW(listview, WM_SETREDRAW, 1, 0)
+            # 关掉重绘后必须手动重画一次，否则内容要等下一次窗口失效才出现
+            user32.InvalidateRect(listview, None, True)
+        finally:
+            self._filling = False
 
     def _set_text(self, cid, text: str) -> None:
         handle = self._controls.get(cid)
@@ -621,8 +829,21 @@ class StatsWindow:
         if msg == WM_COMMAND:
             cid = wparam & 0xFFFF
             code = (wparam >> 16) & 0xFFFF
-            if code == BN_CLICKED and cid == IDC_REFRESH:
-                self.refresh()
+            if code == BN_CLICKED:
+                if cid == IDC_REFRESH:
+                    self.refresh()
+                    return True, 0
+                if cid == IDC_PREV:
+                    self._step(-1)
+                    return True, 0
+                if cid == IDC_NEXT:
+                    self._step(1)
+                    return True, 0
+            if cid == IDC_PICK and code == CBN_SELCHANGE:
+                # 下拉框里挑了某一天 / 某一次开机 → 表格跟着跳到那一行
+                index = self._selected_index()
+                if index >= 0:
+                    self._select_index(index, sync_pick=False)
                 return True, 0
             return False, 0
         if msg == WM_NOTIFY:
@@ -630,8 +851,20 @@ class StatsWindow:
             if header.idFrom == IDC_TAB and header.code == TCN_SELCHANGE:
                 self.refresh()
                 return True, 0
+            if header.idFrom == IDC_LIST and header.code == LVN_ITEMCHANGED:
+                # 灌数据时每次 InsertItem 都会触发一次，用标志挡掉（否则白跑一堆）
+                if not self._filling:
+                    listview = self._controls.get(IDC_LIST)
+                    if listview:
+                        index = int(user32.SendMessageW(
+                            listview, LVM_GETNEXTITEM, -1, LVNI_SELECTED))
+                        if 0 <= index < len(self._rows):
+                            self._select_index(index, sync_pick=True)
+                return True, 0
             return False, 0
-        if msg == WM_CTLCOLORSTATIC:
+        if msg == WM_CTLCOLORSTATIC or msg == WM_CTLCOLOREDIT:
+            # 明细框是只读 EDIT：不接管的话它会是纯白底，和窗口的浅灰拼在一起
+            # 像贴了张别的程序里的便签。接管成同一个底色，视觉上才是「一块内容」。
             gdi32.SetBkMode(wparam, TRANSPARENT)
             return True, self._bg_brush or 0
         if msg == WM_CLOSE:
@@ -641,8 +874,7 @@ class StatsWindow:
             _windows.pop(self._hwnd, None)
             self._hwnd = None
             self._columns_done = False
-            self._summary_full = ""
-            self._hint_full = ""
+            self._rows = []
             for font in self._fonts.values():
                 gdi32.DeleteObject(font)
             self._fonts.clear()
@@ -652,18 +884,46 @@ class StatsWindow:
 
     # ------------------------------------------------------------- 显隐
 
-    def show(self) -> None:
+    def show(self, kind: str | None = None, key: str | None = None) -> None:
+        """打开窗口。``kind`` / ``key`` 让托盘菜单直接定位到某一天/某一次开机。
+
+        用户的原话是「能不能让用户在菜单里可以自主选择某一天去看」——
+        菜单里点「09-16 周三 0.98 kWh」就该直接落到那一天的明细上，
+        而不是打开一张表让用户自己滚着找。
+        """
         if not self._hwnd:
             if not self.create():
                 return
         else:
             self.refresh()
+        if kind:
+            self._goto(kind, key)
         user32.ShowWindow(self._hwnd, 5)  # SW_SHOW
         # 与详情面板 / 电价窗口同样的路子：先临时置顶再取消，绕开前台锁
         flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
         user32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
         user32.SetWindowPos(self._hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
         user32.SetForegroundWindow(self._hwnd)
+
+    def _goto(self, kind: str, key: str | None) -> None:
+        """切到 ``kind`` 分页，并把选择器定位到 ``key`` 那一条。"""
+        tab = self._controls.get(IDC_TAB)
+        if tab:
+            for index, (k, _label) in enumerate(TABS):
+                if k == kind:
+                    user32.SendMessageW(tab, TCM_SETCURSEL, index, 0)
+                    self.refresh()
+                    break
+        if key is None:
+            return
+        target = str(key)
+        for index, row in enumerate(self._rows):
+            if str(row.get("key", "")) == target:
+                self._select_index(index, sync_pick=True)
+                return
+        # 找不到（比如那条记录刚好被 400 天 / 240 次的上限裁掉了）就停在最新一条，
+        # 不要静默停在空白上让用户以为坏了。
+        _dbg(f"定位不到 {target}（{kind}），已停在最新一条")
 
     def destroy(self) -> None:
         if self._hwnd:
@@ -675,6 +935,14 @@ def _energy(wh: float) -> str:
     if abs(wh) >= 1000.0:
         return f"{wh / 1000.0:.2f} kWh"
     return f"{wh:.1f} Wh"
+
+
+def _stamp(ts) -> str:
+    """开机时刻写成 ``2026-09-16 01:20``。读不出来就原样返回，别崩。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return "—"
 
 
 __all__ = ["StatsWindow", "TABS", "COLUMNS"]

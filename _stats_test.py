@@ -207,12 +207,29 @@ def main() -> int:
     check("坏开机键被丢掉（0 / 非数字）",
           all(k > 0 for k in m6._sessions), f"{sorted(m6._sessions)}")
     check("坏数字被当成 0 而不是抛异常",
-          m6._sessions[bad_key]["cost"] == 0.0
+          m6._sessions[bad_key]["peak"] == 0.0
+          and m6._sessions[bad_key]["valley"] == 0.0
           and m6._sessions[bad_key]["wh"] == 10.0,
           str(m6._sessions.get(bad_key)))
     check("hours 长度不对时整段重置为 24 桶",
           len(m6._hours) == 24 and sum(m6._hours) == 0.0, f"{m6._hours[:3]}…")
+    check("hours_valley 长度不对时也整段重置",
+          len(m6._hours_valley) == 24 and sum(m6._hours_valley) == 0.0)
     check("坏日期不会让按天视图崩掉", isinstance(m6.stats_rows("day"), list))
+
+    # ---- 6b. 峰谷电量读反过来时电费必须夹住（不能出现负电量）----
+    with_state({
+        "ledger_version": 2,
+        "days": {time.strftime("%Y-%m-%d"): [100.0, 60.0, 500.0, 500.0]},
+        "total_wh": 100.0, "total_peak_wh": 500.0, "total_valley_wh": 500.0,
+        "saved_at": time.time(),
+    })
+    m6b = meter_mod.EnergyMeter(cfg)
+    rows = m6b.stats_rows("day")
+    expect = 100.0 / 1000.0 * cfg.price_peak       # 峰谷之和超了 → 全按峰价
+    check("峰+谷超出总量时电费按峰值夹住（不会算出负电量）",
+          rows and abs(rows[0]["cost"] - expect) < 1e-6,
+          f"{rows[0]['cost']:.4f} 期望 {expect:.4f}")
 
     # ---- 7. 上限：开机条数只留最近的 ----
     many = {str(int(time.time()) - i * 3600): [1.0, 0.001, 60.0, time.time() - i * 3600]

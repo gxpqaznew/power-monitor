@@ -102,8 +102,14 @@ def _class_of(hwnd) -> str:
     return buf.value
 
 
-def find_window_by_class(pid_set: set[int], cls: str):
-    """在指定进程的顶层窗口里找某个类名的窗口（托盘消息窗口是隐藏的顶层窗口）。"""
+def find_window_by_class(pid_set: set[int], cls: str, deep: bool = False):
+    """在指定进程的窗口里找某个类名的窗口。
+
+    ``deep=False``（默认）只枚举**顶层**窗口 —— 托盘消息窗口是隐藏的顶层窗口。
+    ``deep=True`` 改成顺着 ``Shell_TrayWnd`` 枚举**子**窗口：长条是任务栏的子窗口，
+    顶层枚举一辈子也找不到它（以前这里就是这么把自己坑了 —— 明明长条好好地挂在
+    任务栏上，探针却一路报「没出现」，看着像功能坏了）。
+    """
     found = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -115,7 +121,12 @@ def find_window_by_class(pid_set: set[int], cls: str):
             return False
         return True
 
-    user32.EnumWindows(cb, 0)
+    if deep:
+        tray = user32.FindWindowW("Shell_TrayWnd", None)
+        if tray:
+            user32.EnumChildWindows(tray, cb, 0)
+    else:
+        user32.EnumWindows(cb, 0)
     return found[0] if found else None
 
 
@@ -268,17 +279,21 @@ def main() -> int:
     cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
     print(f"图标矩形 {rect} → 点 ({cx},{cy})")
 
-    # 🔴 冷启动前几秒点它是没用的：程序还在采第一帧、建长条、暖毛玻璃缓存。
+    # 🔴 冷启动前十几秒点它是没用的：程序还在采第一帧、建长条、暖毛玻璃缓存。
     #    实测刚启动 12 秒时第一下右键会失灵（图标在、位置也对，就是没反应），
     #    跑几个用例之后就 4/4 全稳。所以先等它进稳态再开始，否则会误判成 bug。
-    strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip")
-    waited = 0.0
-    while strip is None and waited < 10.0:
+    #
+    #    长条是任务栏的**子窗口**，枚举要 deep=True 才找得到 —— 以前这里走顶层枚举，
+    #    于是「长条明明挂在任务栏上」却一路打印「没出现」，只是恰好也把 10 秒等满了
+    #    才没暴露成假故障。现在是「找到就早退，但稳态时间一定等满」。
+    deadline = time.time() + 12.0
+    strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip", deep=True)
+    while strip is None and time.time() < deadline:
         pump(0.5)
-        waited += 0.5
-        strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip")
-    print(f"等程序进稳态：长条窗口 {'已出现' if strip else '没出现'}（{waited:.1f}s）")
-    pump(2.0)
+        strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip", deep=True)
+    pump(max(0.0, deadline - time.time()))
+    check("长条挂在任务栏上（任务栏子窗口，不是顶层窗口）", strip is not None,
+          f"hwnd={strip} 已等满 12.0s")
 
     # 清场：上一轮留下的菜单 / 面板会把断言顶成恒真
     close_menus_now()

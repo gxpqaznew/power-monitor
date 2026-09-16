@@ -51,7 +51,9 @@ def main() -> int:
     enable_dpi_awareness()
     name = sys.argv[1] if len(sys.argv) > 1 else "panel_promo.png"
 
-    cfg = Config()
+    # 用 Config.load() 而不是 Config()：后者不读盘，面板上的电价卡会显示默认值，
+    # 与电价设置窗口那张截图对不上（宣传片里两张图并排出现，口径必须一致）。
+    cfg = Config.load()
     panel = Panel(cfg)
     if not panel.create():
         print("面板创建失败")

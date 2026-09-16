@@ -27,7 +27,14 @@ from .w32 import (
     NOTIFYICONDATAW,
     TPM_RIGHTBUTTON,
     TPM_RETURNCMD,
+    WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN,
     WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK,
+    WM_MBUTTONDOWN,
+    WM_MBUTTONUP,
+    WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN,
     WM_RBUTTONUP,
     WM_TRAY_READDED,
     WM_TRAYICON,
@@ -92,6 +99,15 @@ _wndproc_ref: WNDPROC | None = None  # 必须持引用，否则回调被 GC 掉�
 # 开机自启场景下尤其明显，所以必须重试。
 NIM_ADD_ATTEMPTS = 4
 NIM_ADD_DELAY = 2.0
+
+# 托盘图标注册时给的是**一个**回调消息号，explorer 会把落在图标上的**所有**鼠标
+# 消息都用它转发过来 —— 移动、按下、抬起、双击、中键…… 不只是「点击」。
+# 所以必须自己挑出「点击类」：只有它们才代表「用户点了托盘图标」。
+_TRAY_CLICK_EVENTS = frozenset((
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK,
+))
 
 
 def _dbg(msg: str) -> None:
@@ -262,14 +278,21 @@ class TrayIcon:
     def _on_message(self, msg, wparam, lparam):
         if msg == WM_TRAYICON:
             event = lparam & 0xFFFF
-            # 托盘图标的点击**不产生窗口焦点事件**，开着的菜单收不到
-            # WM_KILLFOCUS —— 所以任何一次托盘点击都先把旧菜单关掉。
-            from . import ctxmenu
-            ctxmenu.close_all()
-            if event == WM_LBUTTONUP:
-                self._on_command(CMD_TOGGLE_PANEL)
-            elif event == WM_RBUTTONUP:
-                self._popup()
+            # 🔴 只认「点击类」事件。explorer 把落在托盘图标上的**所有**鼠标消息
+            # 都转发过来，鼠标在图标上飘一下就是一条 WM_MOUSEMOVE ——
+            # 早先对所有事件都调 ctxmenu.close_all()，于是「右键弹出菜单之后，
+            # 鼠标动一下菜单立刻消失」，看起来就是「右键弹不出菜单」。
+            # 毛玻璃抓屏给弹出加了上百毫秒的延迟，这条路径才被踩中。
+            if event in _TRAY_CLICK_EVENTS:
+                _dbg(f"托盘点击 event=0x{event:04X}")
+                # 托盘图标的点击**不产生窗口焦点事件**，开着的菜单收不到
+                # WM_KILLFOCUS —— 所以托盘上的点击要主动把旧菜单关掉。
+                from . import ctxmenu
+                ctxmenu.close_all()
+                if event == WM_LBUTTONUP:
+                    self._on_command(CMD_TOGGLE_PANEL)
+                elif event == WM_RBUTTONUP:
+                    self._popup()
             return True, 0
 
         if msg == self._taskbar_created and self._taskbar_created:

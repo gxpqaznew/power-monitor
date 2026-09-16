@@ -10,7 +10,19 @@ import os
 import time
 from pathlib import Path
 
-_ENABLED = os.environ.get("POWERMON_DEBUG") == "1"
+
+def _flag_file() -> Path:
+    """开发版目录下的 ``_debug.on`` 标记文件。
+
+    为什么要这个：从 WMI / 外部工具启动 dev 版时**没法塞环境变量**
+    （``Win32_Process.Create`` 不支持），而 ``POWERMON_DEBUG=1`` 又必须在
+    进程启动前就存在。放个空文件在项目根就能开日志，排障时省掉一整轮折腾。
+    打包后这个路径落在 ``_MEIxxxx`` 临时目录里，永远不会命中，所以无害。
+    """
+    return Path(__file__).resolve().parent.parent / "_debug.on"
+
+
+_ENABLED = (os.environ.get("POWERMON_DEBUG") == "1") or _flag_file().exists()
 
 
 def enabled() -> bool:

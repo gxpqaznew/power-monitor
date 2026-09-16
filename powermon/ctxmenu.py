@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import ctypes
+import traceback
 
 from . import debug, frost
 from .roundwin import compose_shape_alpha, dib_section, present_layered, round_rect_sdf
@@ -567,10 +568,25 @@ def show(entries, x: int, y: int, on_command,
     全部关闭，回调里可以放心立刻再弹新菜单（「点完不关」靠这个）。
     """
     close_all()
-    if not entries or not _ensure_class():
+    if not entries:
+        _dbg("show 放弃：entries 为空")
         return None
-    menu = CtxMenu(entries, (x, y), on_command, scale=scale, is_sub=False)
-    return menu if menu.hwnd else None
+    if not _ensure_class():
+        _dbg(f"show 放弃：注册窗口类失败 err={ctypes.get_last_error()}")
+        return None
+    # 这一路是**窗口过程里同步调用**的，异常会被 _wnd_proc 的 except 吞掉，
+    # 表现成「右键没反应」，从外面完全看不出原因 —— 所以这里必须自己记一笔。
+    try:
+        menu = CtxMenu(entries, (x, y), on_command, scale=scale, is_sub=False)
+    except Exception as exc:  # noqa: BLE001
+        _dbg(f"show 抛异常：{exc!r}")
+        for line in traceback.format_exc().splitlines():
+            _dbg(f"  | {line}")
+        return None
+    if not menu.hwnd:
+        _dbg("show 返回了菜单对象但 hwnd 为空")
+        return None
+    return menu
 
 
 class CtxMenu:

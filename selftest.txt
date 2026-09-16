@@ -1,4 +1,4 @@
-开机能耗统计 v1.0.12 自检
+开机能耗统计 v1.0.13 自检
 frozen=False  python=3.13.14
 exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
@@ -41,7 +41,7 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 字段多的时候确实折了行  (2 行)
 [PASS] 折行摊成表格：每行格数只差一个（第一行多一格）  ([4, 4])
 [PASS] 每列宽度 ≥ 该列任何一个格子所需（不会把字截掉）  (4 列 / 列宽 [91, 166, 166, 166])
-[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=864)
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=946)
 [PASS] 电价设置窗口能建出来
 [PASS] 省份项数 = 预设数 + 1 个自定义
 [PASS] 打开时定位到默认省份  (四川)

@@ -6,7 +6,17 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[],
-    hiddenimports=['powermon'],
+    # 显式列出子模块：PyInstaller 会顺着静态导入自己找，但「新加的模块」被漏掉
+    # 时源码运行时一切正常、只有冻结后点菜单才崩（appearance / images 是 v1.0.15
+    # 新加的，就属于这一类）。写进来零成本，漏一个的代价是发一版坏包。
+    hiddenimports=[
+        'powermon',
+        'powermon.appearance',
+        'powermon.images',
+        'powermon.stripopts',
+        'powermon.ctxmenu',
+        'powermon.frost',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

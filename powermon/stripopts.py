@@ -116,6 +116,79 @@ SHORT_LABEL = {
 # 里还会按实际可用区域再夹一次。放这么宽是因为它只管「配置别被手改写坏」。
 OFFSET_LIMIT = 4000.0
 
+# ------------------------------------------------------------------ 排列
+# 「一排还是两排」——用户要的是**他自己决定**，而不是程序觉得怎么合适就怎么排。
+#
+#   auto  字段排不下就往上折行（最多 3 排），是默认的「别让我操心」
+#   1/2/3 固定排数：宁可少显示几项也不折行，横向长度完全可控
+#
+# 固定排数时如果任务栏太矮、连一排都放不下（高度不够），会自动退到放得下的
+# 那个排数，而不是把长条整个藏掉（详见 strip._plan 的 rows_allowed）。
+ROWS = [
+    ("auto", "自动"),
+    ("1", "一排"),
+    ("2", "两排"),
+    ("3", "三排"),
+]
+ROW_KEYS = tuple(k for k, _ in ROWS)
+ROW_LABEL = {k: t for k, t in ROWS}
+
+# ------------------------------------------------------------------ 配色方案
+# 一整套协调好的配色（不是让用户从 1677 万色里瞎挑）。每款给四个色：
+#
+#   bg     底色（同时也是毛玻璃的色调层 → 色相稳定、不随壁纸飘）
+#   ink    标签色（次要信息，要压得住但不能糊）
+#   value  数值色（主角，最亮/最饱和的那一个）
+#   accent 悬停描边 / 强调线（拖长条时会亮起来的那圈）
+#   light  浅色系（描边、悬停提亮的方向要反过来）
+#
+# 底色一律取低饱和深色或干净的高明度浅色 —— 长条是贴着任务栏的一条细带，
+# 花哨的底色会把数字吃掉。对比度按 WCAG AA（正文 4.5:1）挑过。
+PALETTES = [
+    ("theme", "跟随质感", None, None, None, None, False),
+    ("graphite", "石墨", (32, 35, 42), (156, 165, 181), (255, 255, 255),
+     (96, 165, 250), False),
+    ("midnight", "午夜", (13, 20, 36), (138, 160, 190), (125, 211, 252),
+     (56, 189, 248), False),
+    ("forest", "松林", (16, 36, 30), (150, 190, 172), (110, 231, 183),
+     (52, 211, 153), False),
+    ("sunset", "落日", (40, 24, 20), (200, 172, 152), (253, 186, 116),
+     (251, 146, 60), False),
+    ("wine", "酒红", (42, 18, 28), (205, 168, 182), (251, 113, 133),
+     (244, 63, 94), False),
+    ("ink", "墨玉", (17, 17, 19), (150, 152, 162), (245, 245, 250),
+     (212, 212, 216), False),
+    ("paper", "宣纸", (247, 245, 240), (118, 108, 94), (28, 25, 21),
+     (180, 83, 9), True),
+    ("rose", "樱花", (253, 242, 245), (122, 86, 102), (190, 24, 93),
+     (236, 72, 153), True),
+    ("mint", "薄荷", (240, 253, 248), (64, 110, 96), (15, 118, 110),
+     (20, 184, 166), True),
+    ("sky", "晴空", (240, 247, 255), (74, 100, 132), (29, 78, 216),
+     (59, 130, 246), True),
+]
+PALETTE_KEYS = tuple(p[0] for p in PALETTES)
+PALETTE_LABEL = {p[0]: p[1] for p in PALETTES}
+_PALETTE_SPEC = {
+    p[0]: {"bg": p[2], "ink": p[3], "value": p[4], "accent": p[5], "light": p[6]}
+    for p in PALETTES
+}
+
+# ------------------------------------------------------------------ 细节开关
+# 「显示方式」里最容易出效果的两个：标签要不要、分隔线要不要。
+# 关掉标签只剩数值，一条能塞下的字段数立刻多出四成 —— 喜欢「只看数」的人会关。
+
+# ------------------------------------------------------------------ 背景图
+BG_FITS = [
+    ("cover", "填满", "等比放大铺满，超出部分裁掉"),
+    ("contain", "适应", "等比缩到完整可见，两侧留空"),
+    ("tile", "平铺", "原尺寸重复铺满（适合小图案 / 纹理）"),
+]
+BG_FIT_KEYS = tuple(k for k, _, _ in BG_FITS)
+BG_FIT_LABEL = {k: t for k, t, _ in BG_FITS}
+BG_OPACITY_MIN = 0
+BG_OPACITY_MAX = 100
+
 
 # ------------------------------------------------------------------ 取值
 
@@ -184,6 +257,96 @@ def offset_x(cfg) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(-OFFSET_LIMIT, min(OFFSET_LIMIT, value))
+
+
+def rows_mode(cfg) -> str:
+    value = getattr(cfg, "strip_rows", "auto")
+    return value if value in ROW_KEYS else "auto"
+
+
+def fixed_rows(cfg) -> int | None:
+    """固定排数；``auto`` 返回 None（交给渲染自己折行）。"""
+    key = rows_mode(cfg)
+    return None if key == "auto" else int(key)
+
+
+def palette_key(cfg) -> str:
+    value = getattr(cfg, "strip_palette", "theme")
+    return value if value in PALETTE_KEYS else "theme"
+
+
+def palette(cfg) -> dict | None:
+    """选中的配色方案；``theme``（跟随质感档）返回 None。
+
+    🔴 ``theme`` 这一档的四个色在目录里就是 None（表示「不覆盖，交给质感档」），
+    所以**不能**直接 ``_PALETTE_SPEC.get(key)`` —— 那会返回一个「字段全是 None」
+    的字典，绘制那边会拿去 ``_colorref(*None)`` 当场炸掉。
+    """
+    key = palette_key(cfg)
+    if key == "theme":
+        return None
+    return _PALETTE_SPEC.get(key)
+
+
+def hex_to_rgb(text) -> tuple[int, int, int] | None:
+    if not isinstance(text, str):
+        return None
+    body = text.strip().lstrip("#")
+    if len(body) == 3:
+        body = "".join(ch * 2 for ch in body)
+    if len(body) != 6:
+        return None
+    try:
+        value = int(body, 16)
+    except ValueError:
+        return None
+    return ((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF)
+
+
+def rgb_to_hex(rgb) -> str:
+    return "#%02X%02X%02X" % tuple(
+        int(max(0, min(255, c))) for c in rgb
+    )
+
+
+def color_override(cfg, name: str) -> tuple[int, int, int] | None:
+    """自定义颜色（name ∈ label / value / bg）；没设或写坏了都返回 None。"""
+    return hex_to_rgb(getattr(cfg, f"strip_{name}_color", ""))
+
+
+def color_spec(cfg) -> tuple:
+    """三个自定义色的规范化形式 —— 直接进 ``_style_key``，改完立刻重画。"""
+    return tuple(color_override(cfg, n) for n in ("label", "value", "bg"))
+
+
+def bg_image(cfg) -> str:
+    value = getattr(cfg, "strip_bg_image", "")
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def bg_fit(cfg) -> str:
+    value = getattr(cfg, "strip_bg_fit", "cover")
+    return value if value in BG_FIT_KEYS else "cover"
+
+
+def bg_opacity(cfg) -> int:
+    try:
+        value = int(getattr(cfg, "strip_bg_opacity", 100))
+    except (TypeError, ValueError):
+        return 100
+    return max(BG_OPACITY_MIN, min(BG_OPACITY_MAX, value))
+
+
+def show_label(cfg) -> bool:
+    value = getattr(cfg, "strip_show_label", True)
+    return value if isinstance(value, bool) else True
+
+
+def show_divider(cfg) -> bool:
+    value = getattr(cfg, "strip_show_divider", True)
+    return value if isinstance(value, bool) else True
 
 
 def _energy(wh: float) -> tuple[str, str]:
@@ -305,6 +468,49 @@ def sanitize(cfg) -> bool:
     if raw_offset != fixed_offset:
         cfg.strip_offset_x = fixed_offset
         changed = True
+
+    # ---- 排列 / 配色 / 背景图 / 细节（v1.0.15 加的外观扩展）----
+    # 这些都是「手改 config.json 会出事」的类型：排数写成 "7" 会让长条怎么排都
+    # 不对，颜色写成 "red" 会让绘制那边拿到 None，背景图路径写成数字会让
+    # os.stat 抛异常。统一在这儿夹回合法值。
+    if getattr(cfg, "strip_rows", None) not in ROW_KEYS:
+        cfg.strip_rows = rows_mode(cfg)
+        changed = True
+    if getattr(cfg, "strip_palette", None) not in PALETTE_KEYS:
+        cfg.strip_palette = palette_key(cfg)
+        changed = True
+
+    for name in ("label", "value", "bg"):
+        attr = f"strip_{name}_color"
+        raw_color = getattr(cfg, attr, "")
+        rgb = hex_to_rgb(raw_color)
+        fixed_color = rgb_to_hex(rgb) if rgb else ""
+        if raw_color != fixed_color:
+            setattr(cfg, attr, fixed_color)
+            changed = True
+
+    raw_image = getattr(cfg, "strip_bg_image", "")
+    if not isinstance(raw_image, str):
+        cfg.strip_bg_image = ""
+        changed = True
+    if getattr(cfg, "strip_bg_fit", None) not in BG_FIT_KEYS:
+        cfg.strip_bg_fit = bg_fit(cfg)
+        changed = True
+    raw_opacity = getattr(cfg, "strip_bg_opacity", 100)
+    fixed_opacity = bg_opacity(cfg)
+    if raw_opacity != fixed_opacity:
+        cfg.strip_bg_opacity = fixed_opacity
+        changed = True
+
+    for attr in ("strip_show_label", "strip_show_divider"):
+        raw_flag = getattr(cfg, attr, True)
+        if not isinstance(raw_flag, bool):
+            # 🔴 不能写成 bool(raw_flag)：``show_label`` / ``show_divider`` 两个
+            # 访问器对「不是 bool」一律当 **True**（只有显式 False 才算关），而
+            # ``bool(None)`` / ``bool(0)`` 都是 False —— 两处口径不一致时，手改过
+            # config.json 的用户会觉得「开着的开关每次启动都被悄悄关掉」。
+            setattr(cfg, attr, True)
+            changed = True
 
     return changed
 

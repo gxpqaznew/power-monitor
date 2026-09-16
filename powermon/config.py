@@ -278,6 +278,29 @@ class Config:
     # 缩放系数还原），所以换 DPI / 改任务栏高度之后位置依然合理。
     strip_offset_x: float = 0.0
 
+    # ---- 任务栏长条 · 呈现方式（v1.0.15）----
+    # 下面这些都在「长条外观…」窗口里改（托盘右键 →「长条外观…」），
+    # 也能直接改 config.json。取值目录仍然只有 stripopts.py 一份真源。
+    # 排数：auto 自动折行 / 1 / 2 / 3 固定排数（固定时宁可少显示几项也不折行）
+    strip_rows: str = "auto"
+    # 配色方案：theme 跟随上面选的「质感」，其余见 stripopts.PALETTES
+    strip_palette: str = "theme"
+    # 自定义颜色（#RRGGBB，空 = 用方案里的）。优先级高于 strip_palette：
+    #   label 每一段的标签色（次要信息）
+    #   value 数值色（主角）
+    #   bg    胶囊底色（同时是毛玻璃的色调层）
+    strip_label_color: str = ""
+    strip_value_color: str = ""
+    strip_bg_color: str = ""
+    # 背景图：本地图片路径（空 = 不贴）。fit 决定怎么铺：cover 填满 /
+    # contain 适应 / tile 平铺；opacity 是 0~100 的不透明度。
+    strip_bg_image: str = ""
+    strip_bg_fit: str = "cover"
+    strip_bg_opacity: int = 100
+    # 细节：关掉标签只剩数值（能塞下的字段更多）；关掉分隔线更干净
+    strip_show_label: bool = True
+    strip_show_divider: bool = True
+
     # ---- 整机口径 ----
     # 是否把显示器功耗计入（显示器一般独立计量，默认不计）
     include_monitor: bool = False

@@ -56,9 +56,11 @@ from __future__ import annotations
 
 import ctypes
 
-from . import debug, frost, stripopts, taskbar
+from . import debug, frost, images, stripopts, taskbar
 from .roundwin import compose_shape_alpha, dib_section, present_layered
 from .w32 import (
+    AC_SRC_OVER,
+    BLENDFUNCTION,
     CLEARTYPE_QUALITY,
     DEFAULT_CHARSET,
     DT_CENTER,
@@ -112,6 +114,7 @@ from .w32 import (
     gdi32,
     int_resource,
     kernel32,
+    msimg32,
     user32,
     wintypes,
 )
@@ -409,6 +412,55 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
     }
 
 
+def _apply_scheme(pal: dict, cfg) -> dict:
+    """在「质感档」给出的配色之上，叠用户的**配色方案 + 自定义颜色**。
+
+    优先级（后面覆盖前面）：
+
+    1. 质感档（auto / glass / dark / …）按任务栏采样算出来的那套色；
+    2. ``strip_palette`` 选的整套配色方案（底色 / 标签 / 数值 / 强调）；
+    3. ``strip_label_color`` / ``strip_value_color`` / ``strip_bg_color``
+       三个自定义色 —— 只在用户真的填了的时候生效。
+
+    🔴 换底色时 ``frost_tint`` 必须跟着一起换。色调层就是「糊完任务栏之后盖上
+    来的那层实色」，最终色相由它决定：只改 ``bg`` 不改 ``frost_tint``，会得到
+    「深色的底 + 浅色的雾」这种发灰发绿的脏色。
+    """
+    scheme = stripopts.palette(cfg)
+    bg_c = stripopts.color_override(cfg, "bg")
+    label_c = stripopts.color_override(cfg, "label")
+    value_c = stripopts.color_override(cfg, "value")
+    if scheme is None and bg_c is None and label_c is None and value_c is None:
+        return pal
+
+    out = dict(pal)
+    if scheme is not None:
+        out["accent"] = scheme["accent"]
+        out["ink"] = _colorref(*scheme["value"])
+        out["dim"] = _colorref(*scheme["ink"])
+        out["unit"] = _colorref(*_mix(scheme["ink"], scheme["bg"], 0.30))
+        base_bg = scheme["bg"]
+    else:
+        base_bg = _unpack(pal["bg"])
+
+    tone = bg_c or base_bg
+    edge = (255, 255, 255) if _luma(tone) < 140 else (0, 0, 0)
+    if tone != _unpack(pal["bg"]) or scheme is not None:
+        out["bg"] = _colorref(*tone)
+        out["frost_tint"] = tone
+        # 描边 / 分隔线跟着新底色重算，否则深色卡上会挂一圈浅灰的旧线
+        out["border"] = _colorref(*_mix(tone, edge, 0.20))
+        out["div"] = _colorref(*_mix(tone, edge, 0.24))
+        out["highlight"] = None
+
+    if label_c is not None:
+        out["dim"] = _colorref(*label_c)
+        out["unit"] = _colorref(*_mix(label_c, tone, 0.35))
+    if value_c is not None:
+        out["ink"] = _colorref(*value_c)
+    return out
+
+
 def _apply_hover(pal: dict, active: bool) -> dict:
     """悬停 / 按住时的那套配色 —— 唯一的「这里可以拖」提示。
 
@@ -419,6 +471,9 @@ def _apply_hover(pal: dict, active: bool) -> dict:
     ``bg`` 也一起改是因为线框质感要靠 ``key`` 抠透明底 —— 那里 ``key`` 是真实
     任务栏色，不能跟着悬停变（变了就抠不干净、字会镶边），所以只调 ``bg`` 不动
     ``key``；线框档下 ``bg`` 本来就是哨兵，改了也无害。
+
+    强调色优先用**配色方案自带**的那个（``pal["accent"]``）：用户挑了「樱花」
+    却亮起一圈跟它不搭的蓝，是最容易被一眼看穿的不协调。
     """
     if not active:
         return pal
@@ -427,9 +482,35 @@ def _apply_hover(pal: dict, active: bool) -> dict:
     if pal.get("key") is None:
         bg = _unpack(pal["bg"])
         out["bg"] = _colorref(*_mix(bg, (255, 255, 255), _HOVER_BG_MIX))
-    out["border"] = _colorref(*_mix(_unpack(pal["border"]), _ACCENT, _HOVER_MIX))
+    out["border"] = _colorref(
+        *_mix(_unpack(pal["border"]), pal.get("accent") or _ACCENT, _HOVER_MIX)
+    )
     out["border_w"] = max(int(pal.get("border_w", 1)), _HOVER_BORDER_W)
     return out
+
+
+def _fit_rect(iw: int, ih: int, w: int, h: int, fit: str):
+    """背景图的「目标矩形 + 源矩形」，都在胶囊的局部坐标系里。
+
+    返回 ``(dx, dy, dw, dh, sx, sy, sw, sh)``。
+
+      * ``contain``：整张图等比缩到放得下，两侧/上下留空，源取全图；
+      * ``cover``：等比放大到**铺满**，多出来的从**源**上居中裁掉 ——
+        注意是裁源而不是裁目标：目标始终是整块胶囊，不然边缘会露出底色。
+    """
+    iw = max(1, int(iw))
+    ih = max(1, int(ih))
+    w = max(1, int(w))
+    h = max(1, int(h))
+    if fit == "contain":
+        k = min(w / iw, h / ih)
+        dw = max(1, int(iw * k))
+        dh = max(1, int(ih * k))
+        return ((w - dw) // 2, (h - dh) // 2, dw, dh, 0, 0, iw, ih)
+    k = max(w / iw, h / ih)
+    sw = max(1, min(iw, int(round(w / k))))
+    sh = max(1, min(ih, int(round(h / k))))
+    return (0, 0, w, h, (iw - sw) // 2, (ih - sh) // 2, sw, sh)
 
 
 @WNDPROC
@@ -513,6 +594,14 @@ class TaskbarStrip:
         self._pal: dict | None = None
         # 最近一份快照：拖动时在消息回调里也要能重算落点，找不到 meter 就靠它
         self._last_snap = None
+        # ---- 毛玻璃的两个「借出去」的旋钮 ----
+        # 「长条外观」窗口里的预览条走的是同一套排版代码，它会把这两个临时改掉：
+        #   _frost_key   换一个缓存键，别和任务栏上那条抢同一张糊图
+        #                （预览条的位置 / 尺寸都不同，共用缓存会互相污染）
+        #   _frost_hold  None = 按拖动状态自动（拖动中吃缓存）；预览里强制 True，
+        #                否则设置窗每重绘一次就要藏一次自己 → 闪成一片
+        self._frost_key = "strip"
+        self._frost_hold: bool | None = None
 
     # ------------------------------------------------------------- 生命周期
 
@@ -963,16 +1052,91 @@ class TaskbarStrip:
         if not strength or not self._rect:
             return
         tint = pal.get("frost_tint") or _unpack(pal["bg"])
+        hold = (self._frost_hold if self._frost_hold is not None
+                else self._drag is not None)
         frost.blit(
-            dc, "strip",
+            dc, self._frost_key,
             self._rect[0], self._rect[1], x, y, w, h,
             tint, strength,
             # 抓屏前要把长条自己藏起来：不藏的话抓进来的就是它上一帧的样子，
             # 一帧帧叠着糊下去会越糊越黑。
             hide_hwnd=self._hwnd,
             # 拖动中锁死缓存（重抓要藏窗口，每秒几十次会闪成一片）
-            hold=self._drag is not None,
+            hold=hold,
         )
+
+    def _paint_image(self, dc, x: int, y: int, w: int, h: int,
+                     radius: float) -> None:
+        """把用户在「外观」里选的背景图贴到胶囊里（毛玻璃之上、文字之下）。
+
+        三件事：
+
+        * **按住圆角裁剪**（``CreateRoundRectRgn`` + ``SelectClipRgn``）——
+          不裁的话图片的直角会盖到胶囊的圆角外面，看着像贴歪了的便利贴；
+        * 按 ``cover/contain/tile`` 算目标矩形（``_fit_rect``），
+          ``AlphaBlend`` 按不透明度叠 —— 所以 30% 的图片是「淡淡的底纹」、
+          100% 就是完整的照片背景；
+        * 图解码失败 / 文件不在 / GDI+ 起不来，全都只是**安静跳过**
+          （``images.load`` 返回 None）—— 一张图绝不能把长条的读数带崩。
+        """
+        path = stripopts.bg_image(self.cfg)
+        if not path:
+            return
+        opacity = int(round(stripopts.bg_opacity(self.cfg) * 255 / 100))
+        if opacity <= 0:
+            return
+        pic = images.load(path)
+        if pic is None:
+            return
+
+        src_dc = gdi32.CreateCompatibleDC(dc)
+        if not src_dc:
+            return
+        rgn = gdi32.CreateRoundRectRgn(
+            int(x), int(y), int(x + w) + 1, int(y + h) + 1,
+            int(radius * 2), int(radius * 2),
+        )
+        # 🔴 恢复剪辑区必须用 SaveDC / RestoreDC，**不能**拿 SelectClipRgn 的返回值
+        # 当旧区域句柄传回去：SelectClipRgn 返回的是「区域类型码」（1/2/3，出错 0），
+        # 不是句柄。把 3 当句柄传进下一次 SelectClipRgn = 无效句柄 → DC 的剪辑区
+        # 被搞坏，接着画的东西会被裁掉一大块。
+        #
+        # 这个坑在长条自己身上看不出来：后面画的描边和文字恰好都落在胶囊里面，
+        # 被「裁剩的那个区域」盖住了；可外观窗口是拿**同一个 DC** 接着往预览卡片
+        # 外面画的 —— 表现成「设了背景图之后，「排列」整段和「字号」标题凭空消失」。
+        saved = gdi32.SaveDC(dc) if rgn else 0
+        gdi32.SelectClipRgn(dc, rgn)
+        old_bmp = gdi32.SelectObject(src_dc, pic.bmp)
+        blend = BLENDFUNCTION()
+        blend.BlendOp = AC_SRC_OVER
+        blend.BlendFlags = 0
+        blend.SourceConstantAlpha = max(0, min(255, opacity))
+        blend.AlphaFormat = 0
+        try:
+            if stripopts.bg_fit(self.cfg) == "tile":
+                for ty in range(int(y), int(y + h), pic.h):
+                    for tx in range(int(x), int(x + w), pic.w):
+                        cw = min(pic.w, int(x + w) - tx)
+                        ch = min(pic.h, int(y + h) - ty)
+                        if cw <= 0 or ch <= 0:
+                            continue
+                        msimg32.AlphaBlend(dc, tx, ty, cw, ch,
+                                           src_dc, 0, 0, cw, ch, blend)
+            else:
+                dx, dy, dw, dh, sx, sy, sw, sh = _fit_rect(
+                    pic.w, pic.h, int(w), int(h), stripopts.bg_fit(self.cfg)
+                )
+                msimg32.AlphaBlend(dc, int(x) + dx, int(y) + dy, dw, dh,
+                                   src_dc, sx, sy, sw, sh, blend)
+        finally:
+            gdi32.SelectObject(src_dc, old_bmp)
+            gdi32.DeleteDC(src_dc)
+            if rgn:
+                if saved:
+                    gdi32.RestoreDC(dc, saved)
+                else:
+                    gdi32.SelectClipRgn(dc, None)
+                gdi32.DeleteObject(rgn)
 
     def _raw_text_width(self, dc, text: str, font) -> int:
         """量文本宽度（带缓存）。
@@ -1064,6 +1228,15 @@ class TaskbarStrip:
             tuple(stripopts.enabled_fields(self.cfg)),
             self._hover,
             stripopts.locked(self.cfg),
+            # ---- 呈现方式（v1.0.15）：这些同样只由 _style_key 负责触发重画 ----
+            stripopts.rows_mode(self.cfg),
+            stripopts.palette_key(self.cfg),
+            stripopts.color_spec(self.cfg),
+            stripopts.bg_image(self.cfg),
+            stripopts.bg_fit(self.cfg),
+            stripopts.bg_opacity(self.cfg),
+            stripopts.show_label(self.cfg),
+            stripopts.show_divider(self.cfg),
         )
 
     def _content_key(self, snap) -> tuple:
@@ -1092,6 +1265,8 @@ class TaskbarStrip:
                 # 结果就是在深色任务栏上画一条浅灰底黑字，非常突兀。
                 light = _luma(sample) >= 128
         pal = _palette_for(theme, sample, light)
+        # 用户选的配色方案 / 自定义颜色盖在质感档之上（见 _apply_scheme）
+        pal = _apply_scheme(pal, self.cfg)
         active = self._hover or self._drag is not None
         return _apply_hover(pal, active) if active else pal
 
@@ -1278,6 +1453,9 @@ class TaskbarStrip:
             radius = min(canvas_h / 2.0, canvas_h * _MULTI_ROW_RADIUS_RATIO)
         self._radius = radius
         self._frost_bg(dc, origin_x, origin_y, width, canvas_h, pal)
+        # 背景图贴在毛玻璃**之上**：毛玻璃负责和任务栏融合，图片是用户自己要的
+        # 那层「贴膜」，按不透明度叠上去（100% 就是纯图片背景）。
+        self._paint_image(dc, origin_x, origin_y, width, canvas_h, radius)
         # 高光必须在画文字**之前**铺，否则会把刚画上去的字一起洗白。
         if pal["highlight"] is not None:
             self._highlight(width, canvas_h, origin_x, origin_y, pal["highlight"])
@@ -1296,6 +1474,11 @@ class TaskbarStrip:
         label_w = grid["label_w"]
         col_w = grid["col_w"]
         div_px = max(1, scale)
+        # 这两个开关同时影响量宽（_grid）和这里 —— 必须用同一份判断，
+        # 否则会出现「按有标签量宽、按没标签绘制」的错位。
+        show_label = bool(grid.get("show_label", True))
+        show_div = bool(grid.get("show_div", True))
+        label_gap = gap_label if show_label else 0.0
         for index, row in enumerate(rows):
             top = band_top + row_h * index
             mid = top + row_h / 2.0
@@ -1303,9 +1486,10 @@ class TaskbarStrip:
             for j, (_key, label, value, unit) in enumerate(row):
                 slot = label_w[j]
                 w_value = self._text_width(dc, value, fonts["value"])
-                self._text(dc, label, x, top, slot + 1, row_h,
-                           fonts["label"], pal["dim"])
-                vx = x + slot + gap_label
+                if show_label:
+                    self._text(dc, label, x, top, slot + 1, row_h,
+                               fonts["label"], pal["dim"])
+                vx = x + slot + label_gap
                 self._text(dc, value, vx, top, w_value + 2, row_h,
                            fonts["value"], pal["ink"])
                 if unit:
@@ -1313,7 +1497,7 @@ class TaskbarStrip:
                     self._text(dc, unit, vx + w_value + gap_unit, top,
                                w_unit + 2, row_h, fonts["unit"], pal["unit"])
                 x += col_w[j]
-                if j < len(row) - 1:
+                if show_div and j < len(row) - 1:
                     x += div_margin
                     div_h = row_h * 0.46
                     self._fill(dc, x, mid - div_h / 2, div_px, div_h, pal["div"])
@@ -1350,13 +1534,20 @@ class TaskbarStrip:
 
         单行列数 = 字段数，列宽就是格子自身宽度 —— 所以只勾几项时算出来的
         尺寸和加折行之前**逐像素一致**。
+
+        「显示标签」关掉时标签槽宽度按 0 算、「显示分隔线」关掉时不再给分隔线
+        留位置 —— 量宽和绘制必须同时认这两个开关，否则窗口会按「有标签」量出来、
+        却按「没标签」画，右边露出一块空白。
         """
+        show_label = stripopts.show_label(self.cfg)
+        show_div = stripopts.show_divider(self.cfg)
         cols = max((len(r) for r in rows), default=0)
         label_w = [0.0] * cols
         rest_w = [0.0] * cols
         for row in rows:
             for j, (key, label, value, unit) in enumerate(row):
-                w_label = self._text_width(dc, label, fonts["label"])
+                w_label = (self._text_width(dc, label, fonts["label"])
+                           if show_label else 0.0)
                 plan_value, plan_unit = _plan_cell(key, value, unit)
                 w_value = max(self._text_width(dc, value, fonts["value"]),
                               self._text_width(dc, plan_value, fonts["value"]))
@@ -1371,13 +1562,14 @@ class TaskbarStrip:
                     rest = w_value + gap_unit + w_unit
                 label_w[j] = max(label_w[j], w_label)
                 rest_w[j] = max(rest_w[j], rest)
-        col_w = [label_w[j] + gap_label + rest_w[j] for j in range(cols)]
+        label_gap = gap_label if show_label else 0.0
+        col_w = [label_w[j] + label_gap + rest_w[j] for j in range(cols)]
         total = sum(col_w)
-        if cols > 1:
+        if cols > 1 and show_div:
             total += (cols - 1) * (div_margin * 2 + 1)
         return {
             "cols": cols, "col_w": col_w, "label_w": label_w, "rest_w": rest_w,
-            "width": total,
+            "width": total, "show_label": show_label, "show_div": show_div,
         }
 
     def _fit_sections(self, dc, sections, budget, rows_wanted, gap_label,
@@ -1426,21 +1618,45 @@ class TaskbarStrip:
         5. 再收紧分隔间距（第 2 档密度）重来一遍；
         6. 全部试完仍塞不下，才从后往前丢字段，并且**尽量少丢**。
 
-        单行时**绝不**自动降字号：用户点了「巨大」就该是巨大，哪怕因此少显示
-        几项 —— 否则「调字号没反应」比「少显示一项」更让人费解。同理，第 0 档
-        密度是外观契约，只有前面全部失败才会动到标签和间距。
+        字号不会「偷偷变小」：候选顺序是 ①同一档字号下先试折行 ②全都排不下才
+        降到更小的字号。单行（``(1, base_font)``）永远排在 ``(2, base_font)``
+        前面，所以自动折行时用户点的字号只有真没办法了才会被动。用户**主动选**
+        「一排」时没有折行这条路，代价是要么字小一点、要么少显示两项 —— 这里
+        选前者（降字号），因为「我勾了 12 项却只出来 10 项」比「字小了一档」
+        难解释得多；真要丢字段只会发生在第二遍兜底里。
+
+        第 0 档密度（原样标签、原始间距）是外观契约，只有前面全部失败才会动到
+        标签和间距。
         """
         base_font = self._font_scale()
         smaller = [v for v in reversed(stripopts.FONT_SCALE_VALUES) if v < base_font]
         pad_mult = stripopts.size_spec(self.cfg)[1]
         pad_x = _PAD_X * scale * pad_mult
         budget = max(1, limit - int(round(pad_x * 2)))
+        # 用户在「外观」里选了几排：None = auto（自己折行），1/2/3 = 固定排数
+        fixed = stripopts.fixed_rows(self.cfg)
 
         def max_rows_for(font_scale: float) -> int:
             row_h = self._row_height(scale, font_scale)
             if max_height <= 0:
                 return 1
             return max(1, min(_MAX_ROWS, int(max_height // row_h)))
+
+        def rows_allowed(rows_wanted: int, font_scale: float) -> bool:
+            """这个「几排」在这一档字号下放行吗。
+
+            🔴 固定排数只放行 ``min(选的排数, 高度放得下的排数)``：
+
+            * 选两排、但任务栏只有一排的高度 → 退成一排。**不能**直接判「排不下」
+              就放弃所有候选 —— 那会一路掉到兜底分支，把长条整条藏起来（用户选的
+              明明是「两排」，结果什么都没了）。
+            * 选一排、字段又多又宽 → 只走单行分支，第一遍排不下就进第二遍
+              「从后往前丢字段」。这正是用户要的：宁可少显示两项，也不许折行。
+            """
+            top = max_rows_for(font_scale)
+            if fixed is None:
+                return rows_wanted <= top
+            return rows_wanted == min(fixed, top)
 
         # (行数上限, 字号) 候选，按偏好排序
         candidates: list[tuple[int, float]] = [(1, base_font)]
@@ -1450,6 +1666,9 @@ class TaskbarStrip:
         for rows in range(1, _MAX_ROWS + 1):
             for font_scale in smaller:
                 candidates.append((rows, font_scale))
+        # 固定排数不需要重排候选：``rows_allowed`` 会把不合排数的整批挡掉，
+        # 而剩下能通过的里面，「行数少 + 字号大」本来就排在前面
+        # （candidates 的第一项就是 (1, base_font)），正是想要的偏好顺序。
 
         cache: dict[bool, list] = {}
 
@@ -1493,7 +1712,7 @@ class TaskbarStrip:
         # ---- 第一遍：按偏好顺序找「第一个能把所有字段排下」的方案 ----
         for index, (compact, div_mult, gap_mult) in enumerate(_DENSITY):
             for rows_wanted, font_scale in candidates:
-                if rows_wanted > max_rows_for(font_scale):
+                if not rows_allowed(rows_wanted, font_scale):
                     continue
                 # 第 0 档的「单行 + 用户字号」是外观契约，不许换标签 / 收紧间距
                 if index and rows_wanted == 1 and font_scale == base_font:
@@ -1512,7 +1731,7 @@ class TaskbarStrip:
             if not sections:
                 continue
             for rows_wanted, font_scale in candidates:
-                if rows_wanted > max_rows_for(font_scale):
+                if not rows_allowed(rows_wanted, font_scale):
                     continue
                 if index and rows_wanted == 1 and font_scale == base_font:
                     continue

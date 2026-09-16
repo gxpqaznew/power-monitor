@@ -17,12 +17,13 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from powermon import ctxmenu, tray  # noqa: E402
+from powermon import ctxmenu, tray, w32  # noqa: E402
 from powermon.w32 import WM_TRAYICON  # noqa: E402
 
 PASS = FAIL = 0
@@ -146,6 +147,95 @@ def main() -> int:
         t2._on_message(WM_TRAYICON, 1, 0x0200)
         check("WM_MOUSEMOVE 走托盘分支时不会漏给 _extra",
               got == [WM_NCHITTEST], f"got={got}")
+
+        # ---- 7. 重新注册必须带回调 ----------------------------------
+        #
+        # 用户报的第二个 bug：点「常驻任务栏」→ 重启资源管理器 → 图标回来了，
+        # 但右键不出菜单、双击不出卡片、单击也没反应。
+        #
+        # 根因是 set_icon / set_tooltip 往**唯一那份** nid 的 uFlags 上写单字段：
+        # _tick() 每秒先 set_icon（NIF_ICON）再 set_tooltip（NIF_TIP），稳态就剩
+        # NIF_TIP；explorer 重启触发重新 NIM_ADD 时，uCallbackMessage 根本没被
+        # 登记 —— 图标看着完全正常，就是永远收不到点击。
+        calls: list[tuple[int, int, int, int]] = []
+        real_sni = w32.shell32.Shell_NotifyIconW
+        full = w32.NIF_ICON | w32.NIF_MESSAGE | w32.NIF_TIP
+
+        def fake_sni(action, nid_ptr):
+            nid = ctypes.cast(
+                nid_ptr, ctypes.POINTER(w32.NOTIFYICONDATAW)
+            ).contents
+            calls.append((int(action), int(nid.uFlags),
+                          int(nid.uCallbackMessage), int(nid.uID)))
+            return 1
+
+        w32.shell32.Shell_NotifyIconW = fake_sni
+        try:
+            calls.clear()
+            t3 = make(c)
+            t3._hwnd = 0x1234
+            t3._hicon = 0x5678
+            t3._tip = "init"
+            t3._add(retries=1)
+            check("首次 NIM_ADD 带完整 flags（ICON|MESSAGE|TIP）",
+                  [f for a, f, _cb, _uid in calls if a == w32.NIM_ADD] == [full],
+                  f"{[hex(f) for a, f, _c, _u in calls if a == w32.NIM_ADD]}")
+
+            for i in range(3):          # 模拟 _tick 反复 MODIFY
+                t3.set_icon(0x7000 + i)
+                t3.set_tooltip(f"tip{i}")
+            check("set_icon / set_tooltip 之后 nid.uFlags 仍是完整的",
+                  int(t3._nid.uFlags) == full,
+                  f"uFlags={hex(int(t3._nid.uFlags))}")
+            check("MODIFY 在副本上声明本次字段，不污染原件",
+                  sorted({f for a, f, _c, _u in calls if a == w32.NIM_MODIFY})
+                  == sorted({w32.NIF_ICON, w32.NIF_TIP}),
+                  f"{[hex(f) for a, f, _c, _u in calls if a == w32.NIM_MODIFY]}")
+
+            calls.clear()               # explorer 重启：走真实 TaskbarCreated 分支
+            t3._on_message(t3._taskbar_created, 0, 0)
+            adds = [(f, cb) for a, f, cb, _u in calls if a == w32.NIM_ADD]
+            check("★ 重注册（TaskbarCreated）仍然登记 uCallbackMessage",
+                  bool(adds) and all(f & w32.NIF_MESSAGE for f, _cb in adds)
+                  and all(cb == WM_TRAYICON for _f, cb in adds),
+                  f"flags={[hex(f) for f, _c in adds]} "
+                  f"cb={[hex(x) for _f, x in adds]}")
+            check("重注册用的还是同一个 hWnd/uID（图标不会变成孤儿）",
+                  all(uid == 1 for a, _f, _c, uid in calls if a == w32.NIM_ADD),
+                  f"{[uid for a, _f, _c, uid in calls if a == w32.NIM_ADD]}")
+        finally:
+            w32.shell32.Shell_NotifyIconW = real_sni
+
+        # ---- 8. 双击：显示卡片，而不是 toggle 两次 ------------------
+        c.reset()
+        t4 = make(c)
+        feed(t4, 0x0202)                    # 第一次 WM_LBUTTONUP
+        check("单击 → 开关面板（零延迟，不等双击判定）",
+              c.cmds == [tray.CMD_TOGGLE_PANEL], f"cmds={c.cmds}")
+        feed(t4, 0x0203)                    # WM_LBUTTONDBLCLK
+        feed(t4, 0x0202)                    # 双击里的第二次抬起
+        check("★ 双击 → 最终是「显示卡片」，不是又关掉（★ 用户报的 bug）",
+              c.cmds == [tray.CMD_TOGGLE_PANEL, tray.CMD_SHOW_PANEL],
+              f"cmds={c.cmds}")
+
+        c.reset()
+        t5 = make(c)
+        feed(t5, 0x0202)
+        t5._last_up -= 1.0                  # 假装过了一秒：是两次独立单击
+        feed(t5, 0x0202)
+        check("两次慢速单击 → 两次 toggle（面板照样能关）",
+              c.cmds == [tray.CMD_TOGGLE_PANEL, tray.CMD_TOGGLE_PANEL],
+              f"cmds={c.cmds}")
+
+        c.reset()
+        t6 = make(c)
+        feed(t6, 0x0202)
+        feed(t6, 0x0202)                    # 没收到 DBLCLK，但两次挨得很近
+        check("没有 DBLCLK 但两次抬起挨得近 → 仍按双击处理（显示卡片）",
+              c.cmds == [tray.CMD_TOGGLE_PANEL, tray.CMD_SHOW_PANEL],
+              f"cmds={c.cmds}")
+        check("CMD_SHOW_PANEL 与 CMD_TOGGLE_PANEL 不撞号",
+              tray.CMD_SHOW_PANEL != tray.CMD_TOGGLE_PANEL)
 
     finally:
         ctxmenu.close_all = real_close

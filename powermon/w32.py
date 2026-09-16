@@ -428,7 +428,14 @@ gdi32.CreateRoundRectRgn.argtypes = [
 ]
 gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
 gdi32.SelectClipRgn.argtypes = [wintypes.HDC, wintypes.HANDLE]
+# 🔴 返回的是**区域类型码**（NULLREGION=1 / SIMPLEREGION=2 / COMPLEXREGION=3，
+# 出错 0），**不是**被换下来的旧区域句柄 —— 别把它存起来再传回去当句柄用。
+# 要「用完还原」就用 SaveDC / RestoreDC。
 gdi32.SelectClipRgn.restype = ctypes.c_int
+gdi32.SaveDC.argtypes = [wintypes.HDC]
+gdi32.SaveDC.restype = ctypes.c_int
+gdi32.RestoreDC.argtypes = [wintypes.HDC, ctypes.c_int]
+gdi32.RestoreDC.restype = wintypes.BOOL
 
 # --- shell32 ---
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]

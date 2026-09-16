@@ -48,6 +48,8 @@ from .w32 import (
 
 # 菜单命令 ID
 CMD_TOGGLE_PANEL = 1
+# 「确保面板显示」（不 toggle）：托盘双击走这条 —— 见 TrayIcon._on_message
+CMD_SHOW_PANEL = 2
 CMD_MODE_CURRENT = 10
 CMD_MODE_COST = 11
 CMD_MODE_SESSION = 12
@@ -73,6 +75,8 @@ CMD_FIELD_BASE = 80      # 80..99  长条显示内容（strippts.FIELDS 下标�
 # 长条位置：锁定开关 + 位置复位。都不是「档位」，所以各给一个单独的号。
 CMD_TOGGLE_LOCK = 25
 CMD_POS_RESET = 26
+# 打开「长条外观…」设置窗（排数 / 字号 / 配色 / 背景图 / 细节）
+CMD_APPEARANCE = 28
 # 长条字号「复位标准」：拖边缘能把字号调成任意连续值（0.60~1.60），菜单里
 # 六档只是快捷取值，所以给一个一键回 1.00 的单独号（同样不是档位区间）。
 CMD_FONT_RESET = 27
@@ -108,6 +112,19 @@ _TRAY_CLICK_EVENTS = frozenset((
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK,
 ))
+
+# 「刚处理过双击」的宽限期：双击的第二次抬起（up）紧跟在 DBLCLK 之后，
+# 要把它认出来并跳过，否则它会把双击刚显示出来的卡片又 toggle 掉。
+_DBLCLICK_GRACE = 0.9
+
+
+def _double_click_seconds() -> float:
+    """系统设置的双击间隔（秒）。用户可在控制面板改，所以每次都问系统。"""
+    try:
+        value = int(user32.GetDoubleClickTime())
+    except Exception:  # noqa: BLE001
+        return 0.5
+    return max(0.15, min(1.2, value / 1000.0))
 
 
 def _dbg(msg: str) -> None:
@@ -168,8 +185,13 @@ class TrayIcon:
         self._hwnd = None
         self._hicon = None
         self._added = False
+        self._tip = ""
         self._nid = NOTIFYICONDATAW()
         self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        # 双击判定：托盘左键单击 toggle 面板，双击要「显示面板」而不是
+        # toggle 两次（那样面板会闪一下就没了）。见 _on_message。
+        self._last_up = 0.0
+        self._dbl_at = 0.0
 
     # ------------------------------------------------------------- 生命周期
 
@@ -190,13 +212,45 @@ class TrayIcon:
         self._nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._nid.hWnd = self._hwnd
         self._nid.uID = 1
-        self._nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP
         self._nid.uCallbackMessage = WM_TRAYICON
         self._nid.hIcon = hicon
-        self._nid.szTip = tooltip[:127]
         self._hicon = hicon
+        self._tip = tooltip[:127]
+        self._sync_nid()
 
         return self._add(retries=NIM_ADD_ATTEMPTS)
+
+    def _sync_nid(self) -> None:
+        """把 ``self._nid`` 复位成**完整的注册态**。
+
+        🔴 这是「explorer 重启后托盘点击全部失灵」的根因所在，别再简化：
+
+        ``shell32.Shell_NotifyIconW`` 读的是 ``nid.uFlags`` 来决定这次调用管哪些
+        字段。早先 ``set_icon()`` 直接写 ``self._nid.uFlags = NIF_ICON``、
+        ``set_tooltip()`` 写 ``NIF_TIP``，把**唯一那份** nid 越改越窄 ——
+        而 ``_tick()`` 每秒都在调这两个（先 icon 再 tip，所以稳态是「只剩
+        NIF_TIP」）。平时看不出来（图标已经注册好了，MODIFY 只需单字段），
+        可一旦触发**重新 NIM_ADD**（explorer 重启 / 点「常驻任务栏」重启资源
+        管理器），就会拿只带 NIF_TIP 的 nid 去注册：图标确实出现了，但
+        ``uCallbackMessage`` 没登记 —— **右键不出菜单、双击不出卡片、单击也
+        没反应**，而且图标看起来一切正常，极难怀疑到「注册时少了个 flag」。
+
+        所以：ADD 之前一律先把完整 flags 补回去；MODIFY 走副本（见 _copy_nid）。
+        """
+        self._nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP
+        self._nid.uCallbackMessage = WM_TRAYICON
+        self._nid.hWnd = self._hwnd
+        self._nid.uID = 1
+        self._nid.hIcon = self._hicon
+        self._nid.szTip = self._tip
+
+    def _copy_nid(self) -> NOTIFYICONDATAW:
+        """完整注册信息的副本 —— MODIFY 只在副本上改 uFlags，别污染原件。"""
+        dup = NOTIFYICONDATAW()
+        ctypes.memmove(
+            ctypes.byref(dup), ctypes.byref(self._nid), ctypes.sizeof(NOTIFYICONDATAW)
+        )
+        return dup
 
     def _add(self, retries: int = 1) -> bool:
         """注册托盘图标。
@@ -205,11 +259,15 @@ class TrayIcon:
         就返回失败，但这不是永久性故障。失败一次就放弃会让程序误判成
         「系统没有通知区域」而降级，所以按次重试。
         """
+        # 每次 ADD 都从完整态出发（原因见 _sync_nid）
+        self._sync_nid()
         for attempt in range(1, retries + 1):
             ctypes.set_last_error(0)
             if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
                 self._added = True
-                _dbg(f"注册托盘成功（第 {attempt}/{retries} 次尝试）")
+                _dbg(f"注册托盘成功（第 {attempt}/{retries} 次尝试）"
+                     f" uFlags=0x{int(self._nid.uFlags):X}"
+                     f" callback=0x{int(self._nid.uCallbackMessage):X}")
                 return True
             err = ctypes.get_last_error()
             _dbg(f"注册托盘失败 err={err}（第 {attempt}/{retries} 次尝试）")
@@ -247,22 +305,31 @@ class TrayIcon:
     # ------------------------------------------------------------- 更新
 
     def set_icon(self, hicon) -> None:
+        """换图标。
+
+        🔴 MODIFY 走 ``_copy_nid()``：只在副本上写 ``NIF_ICON``，**不能**动
+        ``self._nid.uFlags`` —— 那个字段是「下次 NIM_ADD 要注册什么」的真源，
+        被改窄过一次，重注册时回调就没了（详见 ``_sync_nid``）。
+        """
         if not self._hwnd or not hicon:
             return
         previous = self._hicon
-        self._nid.uFlags = NIF_ICON
-        self._nid.hIcon = hicon
-        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid))
         self._hicon = hicon
+        self._nid.hIcon = hicon
+        nid = self._copy_nid()
+        nid.uFlags = NIF_ICON
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
         if previous:
             user32.DestroyIcon(previous)
 
     def set_tooltip(self, text: str) -> None:
         if not self._hwnd:
             return
-        self._nid.uFlags = NIF_TIP
-        self._nid.szTip = text[:127]
-        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid))
+        self._tip = text[:127]
+        self._nid.szTip = self._tip
+        nid = self._copy_nid()
+        nid.uFlags = NIF_TIP
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
     # ------------------------------------------------------------- 消息
 
@@ -289,10 +356,29 @@ class TrayIcon:
                 # WM_KILLFOCUS —— 所以托盘上的点击要主动把旧菜单关掉。
                 from . import ctxmenu
                 ctxmenu.close_all()
-                if event == WM_LBUTTONUP:
-                    self._on_command(CMD_TOGGLE_PANEL)
-                elif event == WM_RBUTTONUP:
+                # 左键：单击 = 开/关详情面板；双击 = 让卡片显示出来。
+                #
+                # 🔴 双击不能靠「toggle 两次」——Windows 发的是
+                # down → up → DBLCLK → up，两次 up 各 toggle 一次，净效果是
+                # 面板开了又关，用户看到的是「双击没反应（卡片闪一下）」。
+                # 所以：第一次 up 照常 toggle（单击要零延迟响应，不能等双击判定），
+                # 之后的 DBLCLK / 第二次 up 改成幂等的「确保显示」。
+                if event == WM_RBUTTONUP:
                     self._popup()
+                elif event == WM_LBUTTONDBLCLK:
+                    self._dbl_at = time.monotonic()
+                    self._on_command(CMD_SHOW_PANEL)
+                elif event == WM_LBUTTONUP:
+                    now = time.monotonic()
+                    if now - self._dbl_at <= _DBLCLICK_GRACE:
+                        pass        # 双击里的第二次抬起，上面已经 show 过
+                    elif (self._last_up
+                          and now - self._last_up <= _double_click_seconds()):
+                        # 没收到 DBLCLK 但两次抬起挨得很近：仍然当成双击
+                        self._on_command(CMD_SHOW_PANEL)
+                    else:
+                        self._on_command(CMD_TOGGLE_PANEL)
+                    self._last_up = now
             return True, 0
 
         if msg == self._taskbar_created and self._taskbar_created:

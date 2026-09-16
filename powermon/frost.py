@@ -132,6 +132,25 @@ def _gdiplus():
         lib.GdipDisposeImage.restype = ctypes.c_int
         lib.GdipDeleteGraphics.argtypes = [ctypes.c_void_p]
         lib.GdipDeleteGraphics.restype = ctypes.c_int
+        # ---- 图片解码（给长条的背景图用，见 images.py）----
+        # GDI 自带的 LoadImage 只认 BMP/ICO，PNG/JPG/WebP 都得走 GDI+。
+        # 这里顺手把那条链的函数也注册上，省得 images 那边再开关一次 GDI+。
+        lib.GdipCreateBitmapFromFile.argtypes = [
+            wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.GdipCreateBitmapFromFile.restype = ctypes.c_int
+        lib.GdipGetImageWidth.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.GdipGetImageWidth.restype = ctypes.c_int
+        lib.GdipGetImageHeight.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.GdipGetImageHeight.restype = ctypes.c_int
+        lib.GdipCreateHBITMAPFromBitmap.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.HBITMAP), ctypes.c_uint,
+        ]
+        lib.GdipCreateHBITMAPFromBitmap.restype = ctypes.c_int
         token = ctypes.c_ulong(0)
         inp = _GdiplusStartupInput(1, None, False, False)
         if lib.GdiplusStartup(ctypes.byref(token), ctypes.byref(inp), None) != 0:
@@ -142,6 +161,16 @@ def _gdiplus():
     except Exception:
         _gp = False
     return _gp or None
+
+
+def gdiplus():
+    """给别的模块用的 GDI+ 句柄（``None`` = 这台机器上没有 / 起不来）。
+
+    ``images.py`` 加载 PNG/JPG 背景图要用它 —— GDI+ 在这里统一初始化一次，
+    别的地方不要再 ``GdiplusStartup`` 一遍（重复初始化要配套 Shutdown，
+    忘了就在进程退出时留下一个悬着的 token）。
+    """
+    return _gdiplus()
 
 
 def available() -> bool:

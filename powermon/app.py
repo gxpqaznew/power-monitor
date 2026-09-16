@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import APP_NAME, __version__
 from . import debug, stripopts, trayreg
+from .appearance import AppearanceWindow
 from .config import CONFIG_PATH, Config, app_dir
 from .fee_dialog import FeeSettingsDialog
 from .iconmake import make_icon, tray_label
@@ -30,6 +31,7 @@ from .strip import TaskbarStrip
 from .stats import StatsWindow
 from .tray import (
     CMD_ABOUT,
+    CMD_APPEARANCE,
     CMD_FEE_SETTINGS,
     CMD_FIELD_BASE,
     CMD_FONT_BASE,
@@ -44,6 +46,7 @@ from .tray import (
     CMD_QUIT,
     CMD_RESET,
     CMD_SIZE_BASE,
+    CMD_SHOW_PANEL,
     CMD_STATS,
     CMD_THEME_BASE,
     CMD_TOGGLE_AUTOSTART,
@@ -157,6 +160,43 @@ def _kwh(wh: float) -> str:
     return f"{wh:.0f} Wh"
 
 
+# --------------------------------------------------------------------------- 外观项
+# 「长条外观」窗口（appearance.py）发出的每一个 kind 都要落在这张表里。
+#
+# 为什么不直接在每个分支里写死属性名：窗口那边是 ``_apply(kind, value)``
+# 一路回调过来的，**kind 拼错 / 忘了一个分支时不会报错，只是静默什么都不做**
+# —— 用户看到的就是「点了没反应」，而日志、异常全都干干净净。所以这张表是
+# 「窗口能发什么」和「app 认什么」之间的唯一契约：
+#   * ``_set_strip_option`` 用它找属性；
+#   * 不认识的 kind 会在调试日志里留一行（不再静默）；
+#   * ``_appearanceshot.py`` 双向核对（窗口发的 ⊆ 这里列的）。
+_STR_ATTRS = {
+    "rows": "strip_rows",
+    "palette": "strip_palette",
+    "bg_image": "strip_bg_image",
+    "bg_fit": "strip_bg_fit",
+    "label_color": "strip_label_color",
+    "value_color": "strip_value_color",
+    "bg_color": "strip_bg_color",
+}
+_BOOL_ATTRS = {
+    "show_label": "strip_show_label",
+    "show_divider": "strip_show_divider",
+}
+# kind → 配置属性（枚举型 / 数值型的那几个也一并列进来）
+KIND_ATTR = {
+    **_STR_ATTRS,
+    **_BOOL_ATTRS,
+    "font": "strip_font_scale",
+    "size": "strip_size",
+    "bg_opacity": "strip_bg_opacity",
+    "theme": "strip_theme",
+}
+# ``field`` 只由托盘菜单用（勾选显示项），窗口不发；留在这里是为了让
+# 「_set_strip_option 认识哪些 kind」有一份完整的名单。
+APPEARANCE_KINDS = tuple(KIND_ATTR) + ("field",)
+
+
 
 def _exe_path() -> str:
     """当前程序的「身份」路径——托盘条目就是按它登记的。"""
@@ -209,6 +249,12 @@ class PowerMonitorApp:
         # 用量统计窗口：按天 / 按月 / 按年 / 按每次开机 / 按时段五个维度。
         # 跟电价窗口一样是「平时不建、点了才建」的独立窗口。
         self.stats = StatsWindow(self.meter, self.cfg)
+        # 「长条外观…」窗口：排数 / 字号 / 配色方案 / 自定义颜色 / 背景图 / 细节。
+        # 预览是借长条**自己的排版代码**画的，所以预览里看到的和任务栏上那条
+        # 必然一致（同一份 _layout，不是另画一个示意图）。
+        self.appearance = AppearanceWindow(
+            self.cfg, self.strip, self.meter.snapshot, self._apply_appearance
+        )
         self.tray = TrayIcon(
             self._build_menu, self._on_command, self._on_extra_message
         )
@@ -428,6 +474,9 @@ class PowerMonitorApp:
         menu.attach("长条大小", self._menu_size())
         menu.attach("长条显示内容", self._menu_field())
         menu.attach("长条位置", self._menu_position())
+        # 菜单只能放「档位」，放不下色板 / 滑块 / 选图 —— 所以开一个窗口。
+        # 用户原话：「可编辑属性还是太少了……要让用户自己能选择呈现的方式」。
+        menu.item(CMD_APPEARANCE, "长条外观…（排数 / 配色 / 背景图）")
         menu.separator()
         # 统计放在电价设置上面：用户是「看用量」来的，翻账本比改电价常用得多。
         # 「查看某一天 / 某次开机」是二级子菜单，把最近十条直接摆出来 ——
@@ -475,6 +524,10 @@ class PowerMonitorApp:
                 return "font"
             if cmd == CMD_TOGGLE_PANEL:
                 self._toggle_panel()
+            elif cmd == CMD_SHOW_PANEL:
+                # 托盘双击：卡片要「显示出来」，不能 toggle（那会把刚弹出的
+                # 那张又收回去 —— 用户看到的就是「双击没反应」）。
+                self._show_panel()
             elif cmd in _MODE_BY_CMD:
                 self._set_mode(_MODE_BY_CMD[cmd])
             elif cmd in self.PERSIST_COMMANDS:
@@ -488,6 +541,8 @@ class PowerMonitorApp:
                 return self.ROOT_MENU
             elif cmd == CMD_STATS:
                 self._open_stats()
+            elif cmd == CMD_APPEARANCE:
+                self._open_appearance()
             elif cmd == CMD_FEE_SETTINGS:
                 self._open_fee_settings()
             elif cmd == CMD_OPEN_CONFIG:
@@ -528,34 +583,73 @@ class PowerMonitorApp:
         self._set_strip_option(*pick)
         return anchor
 
-    def _set_strip_option(self, kind: str, value) -> None:
+    def _set_strip_option(self, kind: str, value, persist: bool = True) -> None:
         """改长条外观 / 显示内容：存盘 + 立刻重画。
 
         不重建窗口 —— ``_content_key`` 里已经带了质感 / 字号 / 大小 / 字段，配置一变
         键就变，下一帧 ``_render_if_needed`` 自然会重画。字号或大小引起高度变化时，
         ``tick`` 还会顺手把窗口挪到按新高度算出来的位置。
+
+        ``persist=False`` 用于**滑块拖动中**：外观窗口每移动一个像素都会回调一次，
+        每次都原子写一遍 config.json 太浪费（也伤 SSD）。拖动中只改内存 + 重画，
+        松手时用 ``persist=True`` 落盘一次。
         """
+        cfg = self.cfg
+        # 字符串类（含颜色 #RRGGBB、图片路径）：直接比原值
+        _str_attrs = _STR_ATTRS
+        # 布尔开关
+        _bool_attrs = _BOOL_ATTRS
+
         if kind == "theme":
-            if self.cfg.strip_theme == value:
+            if cfg.strip_theme == value:
                 return
-            self.cfg.strip_theme = value
+            cfg.strip_theme = value
         elif kind == "font":
-            if abs(stripopts.font_scale(self.cfg) - value) < 1e-6:
+            if abs(stripopts.font_scale(cfg) - value) < 1e-6:
                 return
-            self.cfg.strip_font_scale = value
+            cfg.strip_font_scale = value
         elif kind == "size":
-            if self.cfg.strip_size == value:
+            if cfg.strip_size == value:
                 return
-            self.cfg.strip_size = value
+            cfg.strip_size = value
         elif kind == "field":
             # 最后一项不允许取消：toggle_field 会拒绝并返回 False（菜单里也已灰掉）
-            if not stripopts.toggle_field(self.cfg, value):
+            if not stripopts.toggle_field(cfg, value):
                 return
+        elif kind in _str_attrs:
+            attr = _str_attrs[kind]
+            if getattr(cfg, attr) == value:
+                return
+            setattr(cfg, attr, value)
+        elif kind == "bg_opacity":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return
+            value = max(stripopts.BG_OPACITY_MIN,
+                        min(stripopts.BG_OPACITY_MAX, value))
+            if stripopts.bg_opacity(cfg) == value:
+                return
+            cfg.strip_bg_opacity = value
+        elif kind in _bool_attrs:
+            attr = _bool_attrs[kind]
+            target = bool(value)
+            if bool(getattr(cfg, attr, True)) == target:
+                return
+            setattr(cfg, attr, target)
         else:
+            # 静默失败最难查：窗口发了 kind="xx"、这里不认识 → 点了没反应，
+            # 而且异常、日志什么都没有。留一行给调试日志，再兜一下。
+            _dbg(f"_set_strip_option: 不认识的外观项 kind={kind!r}（已忽略）")
             return
-        self.cfg.save()
+        if persist:
+            cfg.save()
         self.strip.invalidate()
         self._ensure_strip()
+
+    def _apply_appearance(self, kind: str, value, persist: bool = True) -> None:
+        """「长条外观…」窗口的回调：改配置 + 立刻重画长条。"""
+        self._set_strip_option(kind, value, persist=persist)
 
     def _toggle_lock(self) -> None:
         """锁定 / 解锁长条位置。
@@ -594,6 +688,15 @@ class PowerMonitorApp:
     def _toggle_panel(self) -> None:
         if self.panel.is_visible:
             self.panel.hide()
+            return
+        self._show_panel()
+
+    def _show_panel(self) -> None:
+        """确保详情面板显示出来（幂等，不 toggle）。托盘双击用这个。"""
+        if self.panel.is_visible:
+            # 已经开着就刷新一次数据，别把它收回去
+            self.panel.set_data(self.meter.snapshot(), self.meter.curve())
+            self.panel.refresh()
             return
         if not self.panel._hwnd:
             self.panel.create()
@@ -690,6 +793,11 @@ class PowerMonitorApp:
         # 电价或币种可能刚在电价窗口改过，窗口里要显示的是当前值
         self.stats.cfg = self.cfg
         self.stats.show()
+
+    def _open_appearance(self) -> None:
+        """打开「长条外观…」窗口（排数 / 字号 / 配色 / 背景图 / 细节）。"""
+        self.appearance.cfg = self.cfg
+        self.appearance.show()
 
     def _after_fee_saved(self) -> None:
         """电价一改，图标 / 提示 / 面板上的电费立刻跟着变。"""
@@ -1366,6 +1474,123 @@ def self_test() -> int:
                   f"{grid['cols']} 列 / 列宽 {[round(v) for v in grid['col_w']]}")
         finally:
             full_strip.destroy()
+
+        # ---- 长条外观（排数 / 配色 / 背景图 / 细节）----
+        # 冻结成 exe 之后跑不了那些测试脚本，只能让程序自己把这几条报一遍。
+        # 重点有两块：① 新模块（appearance / images）有没有真的打进包 ——
+        # PyInstaller 静默丢模块是老毛病，源码里一切正常、冻结后点菜单直接崩；
+        # ② 配色目录是**设计资产**而不是随手填的常数，得有人守着。
+        from . import images as images_mod
+
+        check("「长条外观」窗口模块已打进包", callable(AppearanceWindow))
+        check("背景图解码模块已打进包（GDI+ 那条路）", callable(images_mod.load))
+
+        rows_keys = [k for k, _label in stripopts.ROWS]
+        check("排列档位是 自动 / 一排 / 两排 / 三排",
+              set(rows_keys) == {"auto", "1", "2", "3"}, "、".join(rows_keys))
+        check("配色是「跟随质感」+ 10 套调好的整组颜色",
+              len(stripopts.PALETTES) == 11 and stripopts.PALETTES[0][0] == "theme"
+              and stripopts.palette(_variant(strip_palette="graphite"))["bg"]
+              == (32, 35, 42),
+              f"{len(stripopts.PALETTES)} 套")
+        check("「跟随质感」不做任何覆盖（不是「字段全 None 的字典」）",
+              stripopts.palette(_variant(strip_palette="theme")) is None)
+        check("填充方式是 填满 / 适应 / 平铺",
+              set(stripopts.BG_FIT_KEYS) == {"cover", "contain", "tile"})
+
+        def _lum(rgb):
+            def chan(v):
+                c = v / 255.0
+                return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            return (0.2126 * chan(rgb[0]) + 0.7152 * chan(rgb[1])
+                    + 0.0722 * chan(rgb[2]))
+
+        worst = ("", 99.0)
+        for _key, label, bg, _ink, value, _accent, _light in stripopts.PALETTES[1:]:
+            hi, lo = sorted((_lum(value), _lum(bg)), reverse=True)
+            if (hi + 0.05) / (lo + 0.05) < worst[1]:
+                worst = (label, (hi + 0.05) / (lo + 0.05))
+        check("每套配色的数值色对底色 ≥ 4.5:1（长条是任务栏上的一条细带，"
+              "淡了就整条糊成一片）",
+              worst[1] >= 4.5, f"最差「{worst[0]}」{worst[1]:.2f}:1")
+
+        dirty = _variant(strip_rows="7", strip_palette="xxx",
+                         strip_label_color="red", strip_bg_image=999,
+                         strip_bg_fit="stretch", strip_bg_opacity=999,
+                         strip_show_divider=None)
+        check("手改出来的外观脏值会被夹回合法",
+              stripopts.sanitize(dirty) is True
+              and dirty.strip_rows == "auto" and dirty.strip_palette == "theme"
+              and dirty.strip_label_color == "" and dirty.strip_bg_image == ""
+              and dirty.strip_bg_fit == "cover" and dirty.strip_bg_opacity == 100
+              and dirty.strip_show_divider is True,
+              f"rows={dirty.strip_rows} fit={dirty.strip_bg_fit} "
+              f"opacity={dirty.strip_bg_opacity}")
+        check("夹过一次之后再夹就不再改动（否则每次启动都要写一次盘）",
+              stripopts.sanitize(dirty) is False)
+
+        # 固定排数要真的改排版：同一批字段，一排最宽、三排最窄。
+        # 比宽度**必须同一档字号** —— 单排排不下时会自动降字号兜底，拿两次
+        # 不同字号的结果比宽度会得出「排数越多越宽」这种假结论。
+        many = ["current", "cpu", "gpu", "base", "cost", "session",
+                "today", "today_cost", "avg", "peak", "uptime", "segment"]
+        row_probe = TaskbarStrip(_variant(strip_fields=many))
+        try:
+            measured = {}
+            for mode in ("1", "2", "3"):
+                row_probe.cfg = _variant(strip_fields=many, strip_rows=mode)
+                plan = row_probe._plan(theme_dc, _ProbeSnap(), 1.0, 4000, 96)
+                measured[mode] = (len(plan["rows"]),
+                                  int(plan["grid"]["width"]),
+                                  plan["font_scale"])
+            check("选「一排 / 两排 / 三排」就真的排成对应的排数",
+                  [measured[m][0] for m in ("1", "2", "3")] == [1, 2, 3],
+                  str({m: v[0] for m, v in measured.items()}))
+            check("同一档字号下排数越多长条越短",
+                  measured["3"][1] < measured["2"][1] < measured["1"][1]
+                  and measured["1"][2] == measured["2"][2] == measured["3"][2] == 1.0,
+                  f"{measured['3'][1]} < {measured['2'][1]} < {measured['1'][1]}"
+                  f"（字号 {measured['1'][2]}）")
+            check("任务栏太矮时固定排数退到放得下的排数（不是整条消失）",
+                  len(row_probe._plan(theme_dc, _ProbeSnap(), 1.0, 4000,
+                                      24)["rows"]) < 3)
+        finally:
+            row_probe.destroy()
+
+        # 背景图几何：目标永远是整块胶囊，源必须裁得出**正尺寸** ——
+        # 0 宽 0 高的 BitBlt / AlphaBlend 什么都不画，现象是「设了背景图但看不见图」。
+        cover = strip_mod._fit_rect(1600, 900, 600, 48, "cover")
+        contain = strip_mod._fit_rect(1600, 900, 600, 48, "contain")
+        tiny = strip_mod._fit_rect(1, 1, 600, 48, "cover")
+        check("背景图 cover：目标铺满胶囊，源按目标比例居中裁剪",
+              cover[:4] == (0, 0, 600, 48)
+              and abs(cover[6] / cover[7] - 600 / 48) < 0.1, str(cover))
+        check("背景图 contain：整图等比缩到放得下、源取全图",
+              contain[4:] == (0, 0, 1600, 900)
+              and contain[2] > 0 and contain[3] > 0, str(contain))
+        check("极端比例也裁得出正尺寸（0 宽的图等于没设）",
+              tiny[6] > 0 and tiny[7] > 0 and tiny[2] > 0 and tiny[3] > 0,
+              str(tiny))
+
+        # 换配色时毛玻璃的色调层必须跟着换：毛玻璃是「先模糊、再叠 tint」，
+        # 只改底色不改 tint 会糊出一层发灰的脏色。
+        pal_auto = strip_mod._palette_for("dark", (32, 32, 32), False)
+        scheme_bg = stripopts.palette(_variant(strip_palette="graphite"))["bg"]
+        tinted = strip_mod._apply_scheme(pal_auto,
+                                         _variant(strip_palette="graphite"))
+        check("换配色方案时毛玻璃色调层跟着底色一起换",
+              tinted["frost_tint"] == scheme_bg
+              and strip_mod._unpack(tinted["bg"]) == scheme_bg,
+              f"tint={tinted['frost_tint']}")
+
+        # 外观窗口真要建一次：它自己注册窗口类、自己管字体和缓冲区，
+        # 冻结之后这类「自己注册窗口类」的地方最容易炸。
+        appearance_probe = AppearanceWindow(_variant(), TaskbarStrip(_variant()),
+                                            _ProbeSnap, lambda *a, **k: None)
+        built_win = appearance_probe.create()
+        check("「长条外观」窗口建得出来", built_win,
+              "" if built_win else f"err={ctypes.get_last_error()}")
+        appearance_probe.destroy()
     finally:
         gdi32.DeleteDC(theme_dc)
         user32.ReleaseDC(None, screen_dc)

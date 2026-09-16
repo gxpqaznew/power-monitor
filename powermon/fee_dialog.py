@@ -16,7 +16,7 @@ from __future__ import annotations
 import ctypes
 import re
 
-from . import debug, tariffs
+from . import debug, frost, tariffs
 from .tariffs import REGIONS, Plan, Region
 from .w32 import (
     BN_CLICKED,
@@ -58,6 +58,7 @@ from .w32 import (
     WM_COMMAND,
     WM_CTLCOLORSTATIC,
     WM_DESTROY,
+    WM_ERASEBKGND,
     WM_SETFONT,
     WNDCLASSEXW,
     WNDPROC,
@@ -304,6 +305,9 @@ class FeeSettingsDialog:
             self._make_fonts()
         self._hinstance = kernel32.GetModuleHandleW(None)
         self._bg_brush = user32.GetSysColorBrush(COLOR_BTNFACE)
+        # 毛玻璃色调层 = 对话框系统底色（同色，只多一层雾 + 模糊）
+        self._frost_tint = (0xF0, 0xF0, 0xF0)
+        self._frost = 200
 
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
@@ -726,7 +730,59 @@ class FeeSettingsDialog:
 
     # ------------------------------------------------------------- 消息
 
+    # --- 毛玻璃底 ---
+
+    def _frost_bg(self, dc, w, h) -> None:
+        """窗口底：实色打底 + 暖好的毛玻璃盖上去（没缓存就只剩实色）。"""
+        if w <= 0 or h <= 0:
+            return
+        rect = wintypes.RECT(0, 0, w, h)
+        user32.FillRect(dc, ctypes.byref(rect), self._bg_brush)
+        info = self._frost_origin()
+        if info is None:
+            return
+        ox, oy, _cw, _ch = info
+        frost.blit(dc, "fee", ox, oy, 0, 0, w, h,
+                   self._frost_tint, self._frost,
+                   hide_hwnd=self._hwnd, hold=True)
+
+    def _frost_origin(self):
+        """客户区左上角在屏幕上的位置（毛玻璃按屏幕坐标抓屏）。"""
+        if not self._hwnd:
+            return None
+        client = wintypes.RECT()
+        if not user32.GetClientRect(self._hwnd, ctypes.byref(client)):
+            return None
+        if client.right <= 0 or client.bottom <= 0:
+            return None
+        origin = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(self._hwnd, ctypes.byref(origin)):
+            return None
+        return origin.x, origin.y, client.right, client.bottom
+
+    def _warm_frost(self) -> None:
+        """显示**之前**把背后的桌面抓下来糊好（那会儿窗口还藏着，抓到的是干净桌面）。"""
+        info = self._frost_origin()
+        if info is None:
+            return
+        ox, oy, w, h = info
+        screen = user32.GetDC(None)
+        dc = gdi32.CreateCompatibleDC(screen)
+        user32.ReleaseDC(None, screen)
+        if not dc:
+            return
+        try:
+            frost.blit(dc, "fee", ox, oy, 0, 0, w, h,
+                       self._frost_tint, self._frost, hide_hwnd=self._hwnd)
+        finally:
+            gdi32.DeleteDC(dc)
+
     def _on_message(self, msg, wparam, lparam):
+        if msg == WM_ERASEBKGND:
+            rect = wintypes.RECT()
+            user32.GetClientRect(self._hwnd, ctypes.byref(rect))
+            self._frost_bg(wparam, rect.right, rect.bottom)
+            return True, 1
         if msg == WM_COMMAND:
             cid = wparam & 0xFFFF
             code = (wparam >> 16) & 0xFFFF
@@ -778,6 +834,13 @@ class FeeSettingsDialog:
         if not self._hwnd:
             if not self.create():
                 return
+        # 必须在 ShowWindow 之前暖：这会儿窗口还藏着，抓到的是干净桌面
+        self._warm_frost()
+        # 暖完必须**强制带擦除地重画一次**：窗口类带 WS_VISIBLE，CreateWindowEx
+        # 那一刻就已经擦过一次背景了（那会儿缓存还是空的，擦出来是死灰色），
+        # 而 ShowWindow 对一个已经可见的窗口不会再触发重画 —— 不补这一下，
+        # 毛玻璃永远只存在于缓存里，屏幕上还是那块灰。
+        user32.InvalidateRect(self._hwnd, None, True)
         user32.ShowWindow(self._hwnd, 5)  # SW_SHOW
         # 与详情面板同样的路子：先临时置顶再取消，绕开系统的前台锁
         flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW

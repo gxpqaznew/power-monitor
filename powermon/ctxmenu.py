@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import ctypes
 
-from . import debug
+from . import debug, frost
 from .roundwin import compose_shape_alpha, dib_section, present_layered, round_rect_sdf
 from .w32 import (
     CLEARTYPE_QUALITY,
@@ -72,6 +72,8 @@ from .w32 import (
 # 固定深色卡片：codex 那种「浮在桌面上」的质感靠的就是不管桌面深浅都一致的
 # 深色底 + 柔影，跟着桌面变浅反而会失去分层感。
 _BG = (30, 32, 40)
+_BG_RGB = (30, 32, 40)     # 毛玻璃的色调层（和 _BG 同色，写成元组给 frost 用）
+_BG_FROST = 205            # 毛玻璃浓度：桌面糊掉后还留一点透光，才是真·亚克力
 _BG_ALPHA = 234            # 半透明：背后桌面隐隐透出来，卡片才有「浮起」的感觉
 _ACCENT = (10, 132, 255)   # hover 条 / 勾选圆点的蓝（macOS system blue）
 _INK = (240, 242, 246)     # 主文字
@@ -363,13 +365,20 @@ def _draw_hover_bar(dc, bag: _GdiBag, geom: _Geom, index: int) -> None:
 # ------------------------------------------------------------------ 整图渲染
 
 
-def render_base(entries, scale: float):
-    """渲染「无 hover」的整张菜单。返回 ``(bgra_bytes, geom)``，失败返回 (None, None)。"""
+def render_base(entries, scale: float, place=None):
+    """渲染「无 hover」的整张菜单。返回 ``(bgra_bytes, geom)``，失败返回 (None, None)。
+
+    ``place(w, h)`` 是可选的「定位置」回调：毛玻璃要抓**卡片背后那块屏幕**，
+    所以位置必须在铺底之前就定下来。传了它就一定会在铺底前被调用一次（调用方
+    用它把算出来的 ``(x, y)`` 存起来，免得再算一遍）；不传就退化成实色底
+    （离屏测试走这条路 —— 离屏没有真实窗口，抓屏没有意义）。
+    """
     screen = user32.GetDC(None)
     dc = gdi32.CreateCompatibleDC(screen)
     user32.ReleaseDC(None, screen)
 
     geom = _layout(entries, scale, dc)
+    at = place(geom.w, geom.h) if place is not None else None
     bmp, view = dib_section(dc, geom.w, geom.h)
     if not bmp:
         gdi32.DeleteDC(dc)
@@ -385,7 +394,16 @@ def render_base(entries, scale: float):
         r_card = wintypes.RECT(geom.margin, geom.margin,
                                geom.margin + geom.shape_w,
                                geom.margin + geom.shape_h)
+        # 实色底先铺：毛玻璃抓不到（离屏 / 屏幕被挡）时它就是最终底色
         user32.FillRect(dc, ctypes.byref(r_card), bag.brush(_BG))
+        if at is not None:
+            # 窗口这会儿还没 CreateWindowEx / ShowWindow，抓进来的是干净的桌面，
+            # 不会把菜单自己上一帧糊进去 —— 所以这里不需要 hide_hwnd。
+            frost.blit(dc, "ctxmenu",
+                       at[0] + geom.margin, at[1] + geom.margin,
+                       geom.margin, geom.margin,
+                       geom.shape_w, geom.shape_h,
+                       _BG_RGB, _BG_FROST)
 
         gdi32.SetBkMode(dc, TRANSPARENT)
         gdi32.SelectObject(dc, font_item)
@@ -575,13 +593,23 @@ class CtxMenu:
         self._geom = None
         self._base = None
 
-        base, geom = render_base(entries, self._scale)
+        # 先定位置、再渲染：毛玻璃要抓卡片背后那块屏幕，铺底之前得知道卡片落在哪。
+        # ``_place`` 只认 geom 的宽高 + origin（子菜单那支还读父菜单的 geom，那个
+        # 早就有了），所以在这里回调是安全的。
+        box: dict = {}
+
+        def _resolve(w: int, h: int):
+            at = self._place(origin, w, h)
+            box["at"] = at
+            return at
+
+        base, geom = render_base(entries, self._scale, place=_resolve)
         if base is None:
             return
         self._base = base
         self._geom = geom
 
-        x, y = self._place(origin, geom.w, geom.h)
+        x, y = box["at"]
         self._pos = (x, y)
         owner = parent.hwnd if parent is not None else None
         self._hwnd = user32.CreateWindowExW(

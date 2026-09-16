@@ -1,4 +1,4 @@
-开机能耗统计 v1.0.11 自检
+开机能耗统计 v1.0.12 自检
 frozen=False  python=3.13.14
 exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 
@@ -27,20 +27,21 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 手改出来的拖动偏移会被夹住、锁定开关会转成布尔  (4000.0/True)
 [PASS] 偏移写成非数字时退回 0（不能让长条算不出位置）  (0.0)
 [PASS] 悬停配色只改描边（不引入任何常驻装饰）
-[PASS] 质感「跟随任务栏」画得出来且内部无空洞  (alpha=255 全部命中)
+[PASS] 质感「跟随任务栏」画得出来且内部无空洞  (alpha=232 全部命中)
 [PASS] 质感「玻璃」画得出来且内部无空洞  (alpha=200 全部命中)
-[PASS] 质感「线框」画得出来且内部无空洞  (可见 226/590px)
+[PASS] 质感「线框」画得出来且内部无空洞  (alpha=205 全部命中)
 [PASS] 质感「深色卡片」画得出来且内部无空洞  (alpha=236 全部命中)
 [PASS] 质感「浅色卡片」画得出来且内部无空洞  (alpha=242 全部命中)
 [PASS] 质感「强调色」画得出来且内部无空洞  (alpha=244 全部命中)
 [PASS] 半透明合成逐行一致（没有横条纹）  (1 种：[(188, 181, 175, 200)])
+[PASS] 抠色模式：纯底色像素被抠成全透明  ([0])
 [PASS] 字号调大会让长条变宽  (598px → 856px)
-[PASS] 大字号 + 宽大档内部无空洞  (alpha=[255])
+[PASS] 大字号 + 宽大档内部无空洞  (alpha=[232])
 [PASS] 可用 883px：8 项全勾一个不丢  (排上 8/8，2 行，密度档 0，字号 0.85)
 [PASS] 字段多的时候确实折了行  (2 行)
 [PASS] 折行摊成表格：每行格数只差一个（第一行多一格）  ([4, 4])
 [PASS] 每列宽度 ≥ 该列任何一个格子所需（不会把字截掉）  (4 列 / 列宽 [91, 166, 166, 166])
-[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=836)
+[PASS] 开始按钮能定位（子窗口，必须 FindWindowEx）  (居中区左边缘=864)
 [PASS] 电价设置窗口能建出来
 [PASS] 省份项数 = 预设数 + 1 个自定义
 [PASS] 打开时定位到默认省份  (四川)
@@ -75,4 +76,4 @@ exe=C:\Users\gxp\.workbuddy\binaries\python\envs\default\Scripts\python.exe
 [PASS] 整张根菜单也能为「继续弹」重建（顶层勾选式开关用）
 [PASS] 顶层三个勾选式开关都登记成「点完不关」  (3)
 
-通过 72 项，失败 0 项
+通过 73 项，失败 0 项

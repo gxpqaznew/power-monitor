@@ -1268,17 +1268,13 @@ def self_test() -> int:
                     check(f"质感「{theme_label}」离屏缓冲建得出", False,
                           "CreateDIBSection 失败")
                     continue
-                lit = sum(1 for a in row if a > 0)
-                if theme_key == "outline":
-                    # 线框：底色被抠成透明，只剩描边和文字 —— 既不能整片实心，
-                    # 也不能整片全空（那说明抠色把描边和文字一起抠掉了）
-                    ok = 0 < lit < len(row)
-                    detail = f"可见 {lit}/{len(row)}px"
-                else:
-                    invisible = [a for a in row if a != pal["alpha"]]
-                    ok = not invisible
-                    detail = (f"alpha={pal['alpha']} 全部命中" if ok
-                              else f"异常 alpha：{sorted(set(invisible))}")
+                # v1.0.13 起 6 个档位全部走毛玻璃/半透明（原来的「线框」也改成
+                # 毛玻璃了，不再靠抠色把底色抠成透明），所以一律要求 alpha 整齐：
+                # 既不能有空洞（某处没画到），也不能超范围（该透明的没透明）。
+                invisible = [a for a in row if a != pal["alpha"]]
+                ok = not invisible
+                detail = (f"alpha={pal['alpha']} 全部命中" if ok
+                          else f"异常 alpha：{sorted(set(invisible))[:5]}")
                 check(f"质感「{theme_label}」画得出来且内部无空洞", ok, detail)
             finally:
                 probe.destroy()
@@ -1303,6 +1299,22 @@ def self_test() -> int:
                 for y in range(ch // 4, ch * 3 // 4)}
         check("半透明合成逐行一致（没有横条纹）", len(rows) == 1,
               f"{len(rows)} 种：{sorted(rows)[:4]}")
+
+        # ---- 抠色模式不能烂掉 ----
+        # 6 个档位现在都不用它了（线框也改了毛玻璃），但 compose_shape_alpha 的
+        # 这条分支得留着 —— 以后要加「真·透明」档还得靠它。直接喂一块纯底色缓冲
+        # 断言它被抠成全透明，别让这条路径悄悄坏掉。
+        kw, kh = 40, 24
+        kbuf = (ctypes.c_ubyte * (kw * kh * 4))()
+        for i in range(kw * kh):
+            kbuf[i * 4] = 0x33        # B
+            kbuf[i * 4 + 1] = 0x22    # G
+            kbuf[i * 4 + 2] = 0x11    # R
+        compose_shape_alpha(kbuf, kw, kh, margin=0, radius=0,
+                            shape_w=kw, shape_h=kh, shadow=0,
+                            shape_alpha=255, key_rgb=(0x11, 0x22, 0x33))
+        keyed = {kbuf[(kh // 2 * kw + x) * 4 + 3] for x in range(4, kw - 4)}
+        check("抠色模式：纯底色像素被抠成全透明", keyed == {0}, f"{sorted(keyed)}")
 
         # 大字号 + 宽大：内容更宽更高，但仍不能有空洞。（顺带验证字体缓存的键
         # 带了字号倍率 —— 不带的话这里会拿回标准字号的字体，宽度就不会变）

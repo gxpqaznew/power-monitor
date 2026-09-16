@@ -111,8 +111,15 @@ def check_alignment(strip) -> int:
     # ⚠️ pal 里存的是 COLORREF（低字节是 **R**，不是 B）；DIB 是 BGRA。
     # 这两个顺序搞反过一次，结果「一条分隔线都没找到」，而空集合让对齐断言
     # 恒真 —— 看着 PASS，其实什么都没验。所以下面还专门挡一句「一个都没找到」。
+    # v1.0.13 起所有档位都是半透明毛玻璃，`compose_shape_alpha` 会把整块 RGB
+    # **按 alpha 预乘**（`int(v * sa / 255)`）。所以直接拿调色板原色去比是找不到
+    # 分隔线的 —— 要先把原色按同一套预乘折算回预期像素值。
+    # （更早的注释写「固定用不透明质感」，那前提已经不存在了。）
     div = pal["div"]
+    alpha = int(pal.get("alpha", 255))
+    k = alpha / 255.0
     dr, dg, db = div & 0xFF, (div >> 8) & 0xFF, (div >> 16) & 0xFF
+    dr, dg, db = int(dr * k), int(dg * k), int(db * k)
     rows = strip._plan_rows
     content_h = strip._plan_height
     band_top = (h - content_h) / 2.0
@@ -120,7 +127,9 @@ def check_alignment(strip) -> int:
 
     def is_div(x, y):
         i = (y * w + x) * 4
-        return view[i] == db and view[i + 1] == dg and view[i + 2] == dr
+        # 容差 1：预乘那次是 int() 截断，四舍五入的写法会差 1
+        return (abs(view[i] - db) <= 1 and abs(view[i + 1] - dg) <= 1
+                and abs(view[i + 2] - dr) <= 1)
 
     found = []
     for i in range(rows):
@@ -181,8 +190,9 @@ def main() -> int:
 
     cfg = Config()
     cfg.strip_enabled = True
-    # 像素级校验要拿分隔线的**原色**去比对，所以固定用不透明质感
-    # （玻璃/深色卡片会把 RGB 按 alpha 预乘，颜色对不上就假报错误）
+    # 像素级校验要拿分隔线颜色当标尺；现在所有档位都半透明（RGB 会被 alpha
+    # 预乘），判据里已经按 alpha 折算过，所以这一档随便选，仍取 auto（采样任务栏
+    # 底色，最贴近日常）
     cfg.strip_theme = "auto"
     if fields == "all":
         cfg.strip_fields = list(stripopts.FIELD_KEYS)

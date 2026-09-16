@@ -12,6 +12,8 @@ from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+# AlphaBlend / TransparentBlt 在 msimg32，不在 gdi32（毛玻璃叠色调要用）
+msimg32 = ctypes.WinDLL("msimg32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -79,6 +81,9 @@ WM_SETCURSOR = 0x0020
 # 捕获被抢走（Alt+Tab、弹出模态框等）时系统会发这个 —— 拖动状态必须在这里复位，
 # 否则光标早松手了长条还黏着鼠标。
 WM_CAPTURECHANGED = 0x0215
+WM_ENTERSIZEMOVE = 0x0231
+# 拖动 / 缩放结束：面板拿它当「该重新抓一次背后的桌面了」的信号
+WM_EXITSIZEMOVE = 0x0232
 WM_KEYDOWN = 0x0100
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
@@ -405,6 +410,14 @@ gdi32.BitBlt.argtypes = [
 ]
 gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
 gdi32.GetDeviceCaps.restype = ctypes.c_int
+# 不声明的话 ctypes 会把 HDC/HBITMAP 当 c_int 转，句柄一超过 int32 就
+# OverflowError（实测偶发：两个同款调用一个成功一个炸）。指针参数用 c_void_p，
+# 这样调用方传 byref(BITMAPINFO) 或裸指针都收。
+gdi32.GetDIBits.argtypes = [
+    wintypes.HDC, wintypes.HBITMAP, ctypes.c_uint, ctypes.c_uint,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+]
+gdi32.GetDIBits.restype = ctypes.c_int
 gdi32.CreateRoundRectRgn.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int
 ]

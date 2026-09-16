@@ -22,7 +22,7 @@ from __future__ import annotations
 import ctypes
 import time
 
-from . import debug
+from . import debug, frost
 from .w32 import (
     CLEARTYPE_QUALITY,
     DEFAULT_CHARSET,
@@ -49,6 +49,7 @@ from .w32 import (
     WM_CLOSE,
     WM_DESTROY,
     WM_ERASEBKGND,
+    WM_EXITSIZEMOVE,
     WM_PAINT,
     WNDCLASSEXW,
     WNDPROC,
@@ -90,6 +91,10 @@ def rgb(r: int, g: int, b: int) -> int:
 # --------------------------------------------------------------------- 配色
 # 一个强调色 + 一套中性灰阶。中性色全部带一点点蓝，比纯灰显得干净。
 BG = rgb(0xF4, 0xF6, 0xF9)
+# 毛玻璃：色调层就是 BG 本身（色相不变，只多一层雾 + 模糊），浓度偏低一点 ——
+# 面板是浅色大窗口，糊太狠会变成一块灰。
+BG_RGB = (0xF4, 0xF6, 0xF9)
+BG_FROST = 196
 CARD = rgb(0xFF, 0xFF, 0xFF)
 INK = rgb(0x12, 0x17, 0x22)
 INK_SOFT = rgb(0x4B, 0x55, 0x66)
@@ -312,6 +317,9 @@ class Panel:
         if not self._hwnd:
             return
         self.refresh()
+        # 必须在 ShowWindow **之前**暖：这会儿窗口还藏着，抓到的是干净的桌面，
+        # 否则会把面板自己糊进底色。
+        self._warm_frost()
         user32.ShowWindow(self._hwnd, 5)  # SW_SHOW
         # 直接 SetForegroundWindow 常常被系统的「前台锁」拒绝（尤其是由别的东西
         # 拉起来的进程），窗口就压在别的窗口后面。通用做法是先临时置顶、再取消
@@ -355,6 +363,13 @@ class Panel:
             return True, 0
         if msg == WM_ERASEBKGND:
             return True, 1  # 双缓冲自己擦，避免闪烁
+        if msg == WM_EXITSIZEMOVE:
+            # 挪完地方背后的桌面就换了一张，重新抓一次。_warm_frost 里
+            # hide_hwnd 会先把窗口藏一下再抓（这一次是躲不掉的闪），
+            # 拖动过程中不抓是为了不闪成灯。
+            frost.invalidate("panel")
+            self._warm_frost()
+            return True, 0
         if msg == WM_CLOSE:
             self.hide()
             return True, 0
@@ -437,6 +452,59 @@ class Panel:
     def _fill(self, dc, x, y, w, h, color) -> None:
         rect = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
         user32.FillRect(dc, ctypes.byref(rect), self._brush(color))
+
+    # --- 毛玻璃底 ---
+
+    def _screen_origin(self):
+        """客户区左上角在屏幕上的位置（毛玻璃按屏幕坐标抓屏）。"""
+        if not self._hwnd:
+            return None
+        client = wintypes.RECT()
+        if not user32.GetClientRect(self._hwnd, ctypes.byref(client)):
+            return None
+        if client.right <= 0 or client.bottom <= 0:
+            return None
+        origin = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(self._hwnd, ctypes.byref(origin)):
+            return None
+        return origin.x, origin.y, client.right, client.bottom
+
+    def _warm_frost(self) -> None:
+        """把面板背后的桌面抓下来糊好塞进缓存。
+
+        必须在**窗口不可见**的时候调（``show_panel`` 里显示之前）：抓屏会把面板
+        自己抓进去，一帧帧叠着糊下去会越糊越黑。窗口本来就藏着时 ``hide_hwnd``
+        不会再显隐一次，所以显示前调它是零闪烁的。
+        """
+        info = self._screen_origin()
+        if info is None:
+            return
+        ox, oy, w, h = info
+        screen = user32.GetDC(None)
+        dc = gdi32.CreateCompatibleDC(screen)
+        user32.ReleaseDC(None, screen)
+        if not dc:
+            return
+        try:
+            frost.blit(dc, "panel", ox, oy, 0, 0, w, h,
+                       BG_RGB, BG_FROST, hide_hwnd=self._hwnd)
+        finally:
+            gdi32.DeleteDC(dc)
+
+    def _frost_bg(self, dc, w, h) -> None:
+        """窗口底：实色 BG 打底，再盖上暖好的毛玻璃（没缓存就只剩实色）。
+
+        ``hold=True``：绘制过程中**绝不重抓**。重抓要先藏窗口，面板每秒重绘一次、
+        拖动时每帧一次，那就成了闪灯。缓存由 ``_warm_frost``（显示前 / 移动结束后）
+        负责刷新。
+        """
+        self._fill(dc, 0, 0, w, h, BG)
+        info = self._screen_origin()
+        if info is None:
+            return
+        ox, oy, _cw, _ch = info
+        frost.blit(dc, "panel", ox, oy, 0, 0, w, h,
+                   BG_RGB, BG_FROST, hide_hwnd=self._hwnd, hold=True)
 
     def _vgradient(self, dc, x, y, w, h, top, bottom) -> None:
         """逐行实色插值。内存 DC 没有 alpha，渐变只能这么硬算，但很便宜。"""
@@ -619,7 +687,7 @@ class Panel:
     def _draw(self, dc) -> None:
         w = self._buffer_w
         h = self._buffer_h
-        self._fill(dc, 0, 0, w, h, BG)
+        self._frost_bg(dc, w, h)
 
         margin = self.s(18)
         inner = w - margin * 2

@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import ctypes
 
-from . import debug, stripopts, taskbar
+from . import debug, frost, stripopts, taskbar
 from .roundwin import compose_shape_alpha, dib_section, present_layered
 from .w32 import (
     CLEARTYPE_QUALITY,
@@ -299,11 +299,17 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
     ``alpha`` 是整块的不透明度（255 = 不透）；``key`` 非空表示走「抠色」模式，
     这时 ``bg`` 只当哨兵色用，最后会被抠成全透明（线框主题）。
     ``highlight`` 非空时会在胶囊上半部铺一层高光渐变。
+
+    ``frost`` 是**毛玻璃浓度**（0 = 不糊，走实色底；非 0 就把背后任务栏糊掉再叠
+    这个浓度），``frost_tint`` 是糊的时候用的色调层。色调层单独存一份、不跟着
+    ``_apply_hover`` 的底色提亮一起变 —— 悬停要是把色调也改了，缓存键就每次都不同，
+    鼠标一划过就得重新抓屏（抓屏要藏窗口，会闪）。反正悬停本来就靠描边变色提示。
     """
     if theme == "dark":
         bg = (26, 28, 33)
         return {
             "bg": _colorref(*bg), "alpha": 236, "key": None,
+            "frost": 196, "frost_tint": bg,
             "border": _colorref(*_mix(bg, (255, 255, 255), 0.16)), "border_w": 1,
             "ink": _colorref(0xF2, 0xF5, 0xFA),
             "dim": _colorref(0xA8, 0xB2, 0xC2),
@@ -315,6 +321,7 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
         bg = (250, 250, 252)
         return {
             "bg": _colorref(*bg), "alpha": 242, "key": None,
+            "frost": 205, "frost_tint": bg,
             "border": _colorref(*_mix(bg, (0, 0, 0), 0.11)), "border_w": 1,
             "ink": _colorref(0x1A, 0x1E, 0x24),
             "dim": _colorref(0x5E, 0x66, 0x74),
@@ -327,6 +334,7 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
         bg = (0x1E, 0x5C, 0xE0)
         return {
             "bg": _colorref(*bg), "alpha": 244, "key": None,
+            "frost": 216, "frost_tint": bg,
             "border": _colorref(*_mix(bg, (255, 255, 255), 0.30)), "border_w": 1,
             "ink": _colorref(0xFF, 0xFF, 0xFF),
             "dim": _colorref(0xD5, 0xE0, 0xFA),
@@ -335,18 +343,17 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
             "highlight": _colorref(*_mix(bg, (255, 255, 255), 0.22)),
         }
     if theme == "outline":
-        # 底色 = 采样到的**真实任务栏色**，同时拿它当抠色键。
+        # 底色 = 采样到的**真实任务栏色**，毛玻璃的色调层也用它。
         #
-        # 这里踩过坑：一开始用醒目的品红当哨兵色，结果每个字都镶一圈紫边 ——
-        # 文字是抗锯齿画的，字边那一圈是「文字色 × 底色」的混合像素，它们不等于
-        # 品红，抠色抠不掉，于是紫边就留在了画面上（实测混合像素是 AC4A66 /
-        # E43181 这种脏紫）。想用「按离底色的距离软抠 + 反解底色」补救，数学上
-        # 要求覆盖率估计得准，而覆盖率无法从颜色反推得足够准，仍有残留。
+        # v1.0.13 起这一档也上毛玻璃了：原来靠「把纯底色像素抠成透明」来透出
+        # 真实任务栏（见下面的历史注释），但那样背景是**清晰**的、只是没有底 ——
+        # 和其余档位的毛玻璃不是一套质感。现在统一成「糊掉 + 叠一层同色薄纱」：
+        # 色调层就是任务栏自己的颜色，所以色相不变，只是加了一层均匀的雾 + 模糊，
+        # 观感和原来「几乎看不出有底色」最接近，同时又是真毛玻璃。
         #
-        # 正确做法是让底色**就是背后的真实颜色**：这样字边混出来的像素恰好等于
-        # 「文字直接画在任务栏上」应有的颜色，于是「纯底色的像素抠成透明、其余
-        # 原样保留不透明」就够了 —— 边缘自动是对的，不需要任何反解。
-        # 代价是底色得靠采样（采样不到才退回注册表口径的近似色）。
+        # 老做法踩过的坑（保留备查）：一开始用醒目的品红当哨兵色，结果每个字都镶
+        # 一圈紫边 —— 文字是抗锯齿画的，字边那一圈是「文字色 × 底色」的混合像素，
+        # 它们不等于品红，抠色抠不掉。后来改成「底色就是背后的真实颜色」才干净。
         if light:
             border = _mix(sample, (0, 0, 0), 0.42)
             div = _mix(sample, (0, 0, 0), 0.22)
@@ -354,7 +361,8 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
             border = _mix(sample, (255, 255, 255), 0.60)
             div = _mix(sample, (255, 255, 255), 0.30)
         return {
-            "bg": _colorref(*sample), "alpha": 255, "key": tuple(sample),
+            "bg": _colorref(*sample), "alpha": 205, "key": None,
+            "frost": 150, "frost_tint": sample,
             "border": _colorref(*border), "border_w": 1,
             "ink": _colorref(0x14, 0x18, 0x1E) if light else _colorref(0xF6, 0xF8, 0xFB),
             "dim": _colorref(0x4E, 0x57, 0x66) if light else _colorref(0xBC, 0xC5, 0xD3),
@@ -373,6 +381,7 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
             ink, dim, unit = (0xF2, 0xF5, 0xF9), (0xB4, 0xBE, 0xCA), (0x99, 0xA3, 0xB4)
         return {
             "bg": _colorref(*bg), "alpha": 200, "key": None,
+            "frost": 132, "frost_tint": bg,
             "border": _colorref(*border), "border_w": 1,
             "ink": _colorref(*ink), "dim": _colorref(*dim), "unit": _colorref(*unit),
             "div": _colorref(*_mix(bg, (0, 0, 0) if light else (255, 255, 255), 0.16)),
@@ -391,7 +400,8 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
         ink, dim, unit = (0xF2, 0xF5, 0xF9), (0xA9, 0xB2, 0xC0), (0x8E, 0x98, 0xA8)
         div = _mix(sample, (255, 255, 255), 0.22)
     return {
-        "bg": _colorref(*bg), "alpha": 255, "key": None,
+        "bg": _colorref(*bg), "alpha": 232, "key": None,
+        "frost": 168, "frost_tint": bg,
         "border": _colorref(*border), "border_w": 1,
         "ink": _colorref(*ink), "dim": _colorref(*dim), "unit": _colorref(*unit),
         "div": _colorref(*div),
@@ -941,6 +951,29 @@ class TaskbarStrip:
         rect = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
         user32.FillRect(dc, ctypes.byref(rect), self._brush(color))
 
+    def _frost_bg(self, dc, x, y, w, h, pal) -> None:
+        """胶囊底色：毛玻璃（糊掉背后的任务栏 + 叠本档色调）或实色兜底。
+
+        先铺一层实色再往上盖毛玻璃 —— 这一层不是多余的：① 毛玻璃抓不到（窗口还
+        没显示、屏幕被挡）时它就是最终配色，② 拖动中 ``hold`` 只会贴旧图，
+        尺寸变大时多出来的那条就靠它兜着，不然是没画过的黑边。
+        """
+        self._fill(dc, x, y, w, h, pal["bg"])
+        strength = int(pal.get("frost") or 0)
+        if not strength or not self._rect:
+            return
+        tint = pal.get("frost_tint") or _unpack(pal["bg"])
+        frost.blit(
+            dc, "strip",
+            self._rect[0], self._rect[1], x, y, w, h,
+            tint, strength,
+            # 抓屏前要把长条自己藏起来：不藏的话抓进来的就是它上一帧的样子，
+            # 一帧帧叠着糊下去会越糊越黑。
+            hide_hwnd=self._hwnd,
+            # 拖动中锁死缓存（重抓要藏窗口，每秒几十次会闪成一片）
+            hold=self._drag is not None,
+        )
+
     def _raw_text_width(self, dc, text: str, font) -> int:
         """量文本宽度（带缓存）。
 
@@ -1244,7 +1277,7 @@ class TaskbarStrip:
         else:
             radius = min(canvas_h / 2.0, canvas_h * _MULTI_ROW_RADIUS_RATIO)
         self._radius = radius
-        self._fill(dc, origin_x, origin_y, width, canvas_h, pal["bg"])
+        self._frost_bg(dc, origin_x, origin_y, width, canvas_h, pal)
         # 高光必须在画文字**之前**铺，否则会把刚画上去的字一起洗白。
         if pal["highlight"] is not None:
             self._highlight(width, canvas_h, origin_x, origin_y, pal["highlight"])

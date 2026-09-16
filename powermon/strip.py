@@ -10,8 +10,9 @@
   * ``tray``  贴着通知区域左边。开始按钮查不到、或者左边实在放不下时自动退回这里。
 
 几个刻意的取舍：
-  * **穿透点击**（``WS_EX_TRANSPARENT``）：长条只负责显示，绝不抢鼠标。否则会把
-    任务栏那一片的右键菜单吃掉。
+  * **默认能拖、不穿透**：整块胶囊就是拖动面（见下面「拖动」一段）。想让长条彻底
+    不碰鼠标，就在托盘菜单里勾上「锁定位置」——那时才加回 ``WS_EX_TRANSPARENT``，
+    变成只显示、纯穿透。
   * **底色默认采样自任务栏**：直接读长条目标位置旁边那一个像素，再往白里调一点点
     当背景。任务栏是亚克力/跟随壁纸的，写死颜色一定不对。用户也可以在托盘菜单里
     把质感换成固定色调（深色 / 浅色 / 强调色卡片）、半透明玻璃、或者只留描边和
@@ -24,15 +25,20 @@
 
 两个后加的东西值得单独讲：
 
-**拖动**（``_grip_*``）。整体保持穿透点击，所以自己收不到任何鼠标消息 —— 于是
-在胶囊两端各挂一个 15px 宽的「把手」子窗口（``WS_EX_LAYERED``，**不带**
-``WS_EX_TRANSPARENT``，所以能收到鼠标），把手自己画两列小圆点当抓手。位置存进
-``cfg.strip_offset_x``（设计基准像素，跟着 DPI / 任务栏大小缩放）。
+**拖动**。默认长条**自己就能拖**：整块胶囊就是拖动面，按住左右拖、双击复位，
+位置存进 ``cfg.strip_offset_x``（设计基准像素，跟着 DPI / 任务栏大小缩放）。
 
-  踩过的坑：把手做成长条的**子窗口**是收不到鼠标的 —— 实测
-  ``WindowFromPoint`` 在把手上返回的是 ``Shell_TrayWnd``：父窗口的
-  ``WS_EX_TRANSPARENT`` 会把子窗口一起带成穿透。所以把手必须做成任务栏的
-  **兄弟窗口**（见 ``_grip_create``），z 序上再压在长条之上。
+  为什么不是「两端各挂一个把手」？试过，不好。把手得画小圆点才看得出能抓，
+  可小圆点摆在一条已经排满数字的胶囊两端非常丑；而不画圆点又没人知道能抓。
+  现在的做法是**把可拖动这件事交给长条本体**：悬停时胶囊的描边会变成一圈
+  强调色的发丝线、光标变 ↔，鼠标一移开就恢复原样 —— 不留任何常驻装饰。
+  代价是长条不再穿透点击，所以托盘菜单里给了一个「锁定位置（穿透点击）」的开关，
+  锁上就恢复成完全看不见摸不着的纯显示窗口。
+
+  ⚠️ 分层窗口的**命中测试是按像素 alpha 走的**：胶囊内部的 alpha 是 255，
+  四个圆角外面和阴影那一圈是 0，于是「胶囊能抓、圆角外照样穿透」是天然成立的，
+  不需要额外做什么。反过来，如果哪天为了好看把整块画布的 alpha 都垫高，
+  长条就会变成一块会吃点击的方板。
 
 **网格对齐**（``_grid``）。折行之后每一行各自从左往右排，同一个字段在两行里的
 起始 x 完全由前面几项有多宽决定 —— 两排的分隔线、数值全都不在一条竖线上，
@@ -58,26 +64,33 @@ from .w32 import (
     DT_VCENTER,
     FW_BOLD,
     FW_NORMAL,
+    GWL_EXSTYLE,
     GWL_STYLE,
+    HTCLIENT,
     HWND_TOPMOST,
     IDC_SIZEWE,
     NULL_BRUSH,
     PS_SOLID,
     SIZE,
     SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED,
     SWP_NOACTIVATE,
     SWP_NOMOVE,
     SWP_NOOWNERZORDER,
     SWP_NOSIZE,
     SWP_NOZORDER,
     SWP_SHOWWINDOW,
+    TME_LEAVE,
+    TRACKMOUSEEVENT,
     TRANSPARENT,
     WM_CAPTURECHANGED,
     WM_DESTROY,
     WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN,
     WM_LBUTTONUP,
+    WM_MOUSELEAVE,
     WM_MOUSEMOVE,
+    WM_RBUTTONUP,
     WM_SETCURSOR,
     WNDCLASSEXW,
     WNDPROC,
@@ -99,24 +112,22 @@ from .w32 import (
 
 _FONT_FACE = "Microsoft YaHei UI"
 _CLASS_NAME = "PowerMonitorTaskbarStrip"
-_GRIP_CLASS = "PowerMonitorStripGrip"
 
-# --------------------------------------------------------------- 拖动把手
-# 胶囊两端各一块「能收到鼠标」的区域（长条本体是穿透的，收不到）。宽度按设计基准
-# 48px 任务栏算，跟着 scale / 内边距倍数走。15px 差不多是「一眼看得见、又不抢戏」，
-# 加上整块高度（约 40px），抓起来很松。
-_GRIP_W = 15.0
-# 把手上那两列小圆点的几何（设计基准像素）：2 列 × 3 行，点半径 / 间距。
-_GRIP_DOT_R = 1.5
-_GRIP_DOT_GAP_X = 4.0
-_GRIP_DOT_GAP_Y = 4.6
-# 点的透明度（0~255）：平时很淡（像是在提示「这里可以抓」），按下去变清晰。
-_GRIP_ALPHA_IDLE = 96
-_GRIP_ALPHA_ACTIVE = 235
-# 把手的「命中底 alpha」：分层窗口按像素 alpha 判命中，alpha=0 的地方鼠标会
-# 穿过去，所以整块把手都要垫一个非 0 的 alpha（2/255 肉眼看不出来）。见 _grip_paint。
-_GRIP_HIT_ALPHA = 2
+# ---------------------------------------------------------------- 拖动（无把手）
+# 悬停 / 按住时，胶囊的描边往这个强调色靠 —— 和详情面板、强调色质感、托盘图标
+# 是同一个蓝，整机看上去是一套东西。0.72 是「一眼看得出变了、但不像故障闪烁」。
+_ACCENT = (0x1E, 0x5C, 0xE0)
+_HOVER_MIX = 0.72
+_HOVER_BORDER_W = 2
+# 悬停时底色也轻轻提一点（往白里 0.06），像卡片被指到的那种反馈
+_HOVER_BG_MIX = 0.06
 # 拖动量的绝对值上限见 stripopts.OFFSET_LIMIT（配置文件校验那边也要用同一个数）
+
+# 窗口类样式：CS_DBLCLKS。没有它收不到 WM_LBUTTONDBLCLK，双击复位就不工作。
+_CS_DBLCLKS = 0x0008
+# 拖动 / 悬停需要鼠标消息，所以默认**不带** WS_EX_TRANSPARENT；
+# 「锁定位置」时才加回去（见 set_interactive）。
+_EX_BASE = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
 
 # 设计基准：任务栏高度 48px 时的那套尺寸。真实尺寸按任务栏高度等比缩放，
 # 这样用户改「任务栏大小」或换 DPI 时长条会跟着变，不会显得突兀。
@@ -238,10 +249,6 @@ def _plan_cell(key: str, value: str, unit: str) -> tuple[str, str]:
 
 _strips: dict[int, "TaskbarStrip"] = {}
 _strip_proc_ref: WNDPROC | None = None
-# 拖动把手（任务栏的兄弟窗口，不是长条的子窗口 —— 见模块 docstring）。
-# hwnd -> 长条实例，和 _strips 一样是给窗口过程查「这块把手归谁」用的。
-_grips: dict[int, "TaskbarStrip"] = {}
-_grip_proc_ref: WNDPROC | None = None
 
 
 def _colorref(r: int, g: int, b: int) -> int:
@@ -375,25 +382,35 @@ def _palette_for(theme: str, sample, light: bool) -> dict:
     }
 
 
+def _apply_hover(pal: dict, active: bool) -> dict:
+    """悬停 / 按住时的那套配色 —— 唯一的「这里可以拖」提示。
+
+    只动两样东西：描边转向强调色、加粗一档；底色再轻轻提亮一点。**不做任何常驻
+    装饰**（早先版本在两端画两列小圆点当抓手，用户的原话是「太丑了」）：
+    鼠标不指着它的时候，长条就是一条干干净净的读数条。
+
+    ``bg`` 也一起改是因为线框质感要靠 ``key`` 抠透明底 —— 那里 ``key`` 是真实
+    任务栏色，不能跟着悬停变（变了就抠不干净、字会镶边），所以只调 ``bg`` 不动
+    ``key``；线框档下 ``bg`` 本来就是哨兵，改了也无害。
+    """
+    if not active:
+        return pal
+    out = dict(pal)
+    # 线框质感要保持「透出任务栏」的观感，底色不能动，只换描边
+    if pal.get("key") is None:
+        bg = _unpack(pal["bg"])
+        out["bg"] = _colorref(*_mix(bg, (255, 255, 255), _HOVER_BG_MIX))
+    out["border"] = _colorref(*_mix(_unpack(pal["border"]), _ACCENT, _HOVER_MIX))
+    out["border_w"] = max(int(pal.get("border_w", 1)), _HOVER_BORDER_W)
+    return out
+
+
 @WNDPROC
 def _strip_proc(hwnd, msg, wparam, lparam):
     strip = _strips.get(hwnd)
     if strip is not None:
         try:
             handled, result = strip._on_message(msg, wparam, lparam)
-            if handled:
-                return result
-        except Exception:  # noqa: BLE001 - 回调里不能让异常逃逸
-            pass
-    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-
-@WNDPROC
-def _grip_proc(hwnd, msg, wparam, lparam):
-    strip = _grips.get(hwnd)
-    if strip is not None:
-        try:
-            handled, result = strip._on_grip_message(hwnd, msg, wparam, lparam)
             if handled:
                 return result
         except Exception:  # noqa: BLE001 - 回调里不能让异常逃逸
@@ -440,15 +457,15 @@ class TaskbarStrip:
         self._plan_height = 0      # 这一帧需要多高（_target_rect 拿它定窗口大小）
         self._radius = 0           # 这一帧用的圆角（多行时会收小）
         self._tw: dict[tuple, int] = {}   # 文本宽度缓存，见 _raw_text_width
-        # ---- 拖动把手 ----
-        # 左 / 右两块把手的 hwnd（任务栏的子窗口，和长条平级）
-        self._grip_hwnds: list[int] = []
-        self._grip_dc = None
-        self._grip_bmp = None
-        self._grip_old = None
-        self._grip_view = None
-        self._grip_w = 0
-        self._grip_h = 0
+        # ---- 拖动（没有把手：整块胶囊就是拖动面）----
+        # 光标是不是停在长条上。悬停时描边转强调色、光标变 ↔ —— 这是唯一一处
+        # 「这里能拖」的提示，不做任何常驻装饰（小圆点那种一眼就丑）。
+        self._hover = False
+        # 是否已经向系统登记过 TME_LEAVE。不登记就收不到 WM_MOUSELEAVE，
+        # 鼠标移开后高亮会一直亮着不灭。
+        self._leave_tracked = False
+        # 右键时弹谁的菜单。由 app 注入 —— 长条不直接依赖托盘对象，方便单测。
+        self.menu_callback = None
         # 拖动中的状态。非 None 就是「正被拖」：里面记着按下时的光标 x 与长条左缘，
         # 之后每个 WM_MOUSEMOVE 只算增量 —— 用增量而不是绝对位置，长条跟着光标走
         # 时不会因为「窗口移动 → 客户区坐标跟着变」而产生反馈自激。
@@ -476,7 +493,8 @@ class TaskbarStrip:
         hinstance = kernel32.GetModuleHandleW(None)
         wc = WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc.style = 0
+        # CS_DBLCLKS：没有它收不到 WM_LBUTTONDBLCLK，双击复位就不工作
+        wc.style = _CS_DBLCLKS
         wc.lpfnWndProc = _strip_proc
         wc.hInstance = hinstance
         wc.lpszClassName = _CLASS_NAME
@@ -492,8 +510,7 @@ class TaskbarStrip:
             return False
         left, top, right, bottom = target
 
-        ex = (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-              | WS_EX_TOPMOST | WS_EX_TRANSPARENT)
+        ex = _EX_BASE | (0 if self._interactive else WS_EX_TRANSPARENT)
         self._hwnd = user32.CreateWindowExW(
             ex, _CLASS_NAME, "PowerMonitorStrip", WS_POPUP,
             left, top, right - left, bottom - top, None, None, hinstance, None,
@@ -521,8 +538,6 @@ class TaskbarStrip:
         self._hidden = False
         self._ensure_above_siblings(force=True)
         self._render_if_needed(snap)
-        self._grip_create()
-        self._grip_render()
         if self._parent:
             debug.log("strip", f"创建成功 rect={target} 已嵌入任务栏 parent={self._parent:#x}")
         else:
@@ -531,7 +546,8 @@ class TaskbarStrip:
 
     def destroy(self) -> None:
         self._drag = None
-        self._grip_destroy()
+        self._leave_tracked = False
+        self._hover = False
         if self._hwnd:
             _strips.pop(self._hwnd, None)
             user32.DestroyWindow(self._hwnd)
@@ -561,36 +577,43 @@ class TaskbarStrip:
             _strips.pop(self._hwnd, None)
             self._hwnd = None
             return True, 0
-        # 穿透点击，别的消息一概不处理
-        return False, 0
-
-    # ------------------------------------------------------- 拖动把手
-
-    def _on_grip_message(self, hwnd, msg, wparam, lparam):
-        """把手的窗口过程：拖动就是在这儿做的。
-
-        长条本体是穿透的、收不到鼠标，所以「拖动」这套动作全挂在两端的把手上。
-        """
         if msg == WM_SETCURSOR:
-            # 水平拖动语义 → 系统的「↔」光标（用户一看就知道能拖）
-            user32.SetCursor(user32.LoadCursorW(None, int_resource(IDC_SIZEWE)))
-            return True, 1
-        if msg == WM_LBUTTONDOWN:
-            self._drag_start(hwnd)
-            return True, 0
+            # lparam 低 16 位是命中测试码：只有落在客户区才改光标，
+            # 边框 / 标题栏上也改的话光标会自己乱闪。
+            if (int(lparam) & 0xFFFF) == HTCLIENT and self._interactive:
+                user32.SetCursor(user32.LoadCursorW(None, int_resource(IDC_SIZEWE)))
+                return True, 1
+            return False, 0
         if msg == WM_MOUSEMOVE:
             if self._drag is not None:
                 self._drag_move()
-                return True, 0
+            elif self._interactive:
+                self._set_hover(True)
             return False, 0
+        if msg == WM_MOUSELEAVE:
+            self._leave_tracked = False
+            if self._drag is None:
+                self._set_hover(False)
+            return False, 0
+        if msg == WM_LBUTTONDOWN:
+            self._drag_start(self._hwnd)
+            return True, 0
         if msg == WM_LBUTTONUP:
             if self._drag is not None:
                 self._drag_end()
-                return True, 0
-            return False, 0
+            return True, 0
         if msg == WM_LBUTTONDBLCLK:
-            # 双击把手 = 位置复位。拖歪了又不想翻菜单的人用得上。
+            # 双击 = 位置复位。拖歪了又不想翻菜单的人用得上。
             self.reset_offset()
+            return True, 0
+        if msg == WM_RBUTTONUP:
+            # 长条默认不再穿透，会把任务栏那一片的右键菜单吃掉 —— 所以这里
+            # 主动把菜单补上（app 注入的回调会弹托盘那整套菜单）。
+            if self.menu_callback is not None:
+                try:
+                    self.menu_callback()
+                except Exception:  # noqa: BLE001 - 弹菜单失败不该带崩消息循环
+                    pass
             return True, 0
         if msg == WM_CAPTURECHANGED:
             # 捕获被系统抢走（Alt+Tab / 弹窗）：当成松手，别让长条继续黏着鼠标
@@ -598,6 +621,52 @@ class TaskbarStrip:
                 self._drag_end()
             return False, 0
         return False, 0
+
+    # ------------------------------------------------------------- 拖动
+
+    @property
+    def _interactive(self) -> bool:
+        """能不能被鼠标碰到（= 能不能拖）。锁定位置后变回穿透窗口。"""
+        return not stripopts.locked(self.cfg)
+
+    def _set_hover(self, on: bool) -> None:
+        """悬停状态变了就重画；顺手登记 WM_MOUSELEAVE。"""
+        if on and not self._leave_tracked and self._hwnd:
+            tme = TRACKMOUSEEVENT()
+            tme.cbSize = ctypes.sizeof(TRACKMOUSEEVENT)
+            tme.dwFlags = TME_LEAVE
+            tme.hwndTrack = self._hwnd
+            tme.dwHoverTime = 0
+            if user32.TrackMouseEvent(ctypes.byref(tme)):
+                self._leave_tracked = True
+        if on == self._hover:
+            return
+        self._hover = on
+        self.invalidate()          # 悬停在 _style_key 里，所以这一下必然重画
+
+    def set_interactive(self, enabled: bool) -> None:
+        """开 / 关「可拖动」。关掉 = 加回 WS_EX_TRANSPARENT，变回纯显示。
+
+        托盘菜单里那个「锁定位置」就是调它。运行期换扩展样式必须带
+        SWP_FRAMECHANGED 让系统重新算一遍窗口的非客户区，否则改动可能不生效。
+        """
+        self._drag = None
+        self._leave_tracked = False
+        self._hover = False
+        if not self._hwnd:
+            return
+        ex = user32.GetWindowLongPtrW(self._hwnd, GWL_EXSTYLE)
+        if enabled:
+            ex &= ~WS_EX_TRANSPARENT
+        else:
+            ex |= WS_EX_TRANSPARENT
+        user32.SetWindowLongPtrW(self._hwnd, GWL_EXSTYLE, ex)
+        user32.SetWindowPos(
+            self._hwnd, None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_FRAMECHANGED,
+        )
+        self.invalidate()
 
     def _cfg_offset(self) -> float:
         """配置里记着的拖动偏移（设计基准像素）。"""
@@ -615,15 +684,6 @@ class TaskbarStrip:
         self._persist_offset()
         self.invalidate()
 
-    def set_grip_enabled(self, enabled: bool) -> None:
-        """开 / 关拖动把手（托盘菜单里那个勾）。"""
-        self._drag = None
-        if enabled:
-            self._grip_create()
-            self._grip_render()
-        else:
-            self._grip_destroy()
-
     def _drag_start(self, hwnd) -> None:
         if not self._rect:
             return
@@ -632,7 +692,8 @@ class TaskbarStrip:
             return
         self._drag = {"cursor": pt.x, "left": self._rect[0]}
         user32.SetCapture(hwnd)
-        self._grip_render()      # 按下就让点变清晰
+        # 拖动期间保持「激活」外观（光标可能被甩出窗口，别让高亮闪掉）
+        self._set_hover(True)
         debug.log("strip", f"开始拖动 left={self._rect[0]} cursor={pt.x}")
 
     def _drag_move(self) -> None:
@@ -663,18 +724,15 @@ class TaskbarStrip:
             SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
         )
         self._rect = target
-        self._grip_sync()
-        self._grip_raise()
 
     def _drag_end(self) -> None:
         self._drag = None
         user32.ReleaseCapture()
         self._persist_offset()
         # 换了位置就要按新位置重新采一次任务栏底色（auto / 玻璃 / 线框三种质感
-        # 的底色是现场采样来的），顺手把把手的小圆点画回「淡」的样子。
+        # 的底色是现场采样来的），顺手把悬停那圈强调描边收掉。
         self._key = None
         self._render_if_needed(self._last_snap)
-        self._grip_render()
         debug.log("strip", f"拖动结束 rect={self._rect} 偏移={self._offset():.1f}")
 
     def _persist_offset(self) -> None:
@@ -689,182 +747,6 @@ class TaskbarStrip:
             self.cfg.save()
         except Exception:  # noqa: BLE001 - 存盘失败不该影响拖动本身
             pass
-
-    def _grip_size(self, scale: float, height: int) -> tuple[int, int]:
-        pad_mult = stripopts.size_spec(self.cfg)[1]
-        return (max(8, int(round(_GRIP_W * scale * pad_mult))), max(8, int(height)))
-
-    def _grip_rects(self) -> list[tuple[int, int, int, int]]:
-        """左右两块把手在**任务栏客户区坐标**下的矩形（左、右）。"""
-        if not self._rect or not self._parent:
-            return []
-        left, top, right, bottom = self._rect
-        w, _h = self._grip_size(self._scale, bottom - top)
-        return [
-            self._client_rect((left, top, left + w, bottom)),
-            self._client_rect((right - w, top, right, bottom)),
-        ]
-
-    def _grip_create(self) -> None:
-        """建两块把手。
-
-        🔴 必须是**任务栏的兄弟窗口**，不能挂成长条的子窗口 —— 实测长条
-        （``WS_EX_TRANSPARENT``）的子窗口一样收不到鼠标：``WindowFromPoint``
-        在把手上返回的是 ``Shell_TrayWnd``。父窗口的透明属性会连带子窗口。
-        """
-        global _grip_proc_ref
-        self._grip_destroy()
-        if not self._parent or not self._rect or not stripopts.grip_enabled(self.cfg):
-            return
-        _grip_proc_ref = _grip_proc
-        hinstance = kernel32.GetModuleHandleW(None)
-        wc = WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        # CS_DBLCLKS：双击复位要用到 WM_LBUTTONDBLCLK
-        wc.style = 0x0008
-        wc.lpfnWndProc = _grip_proc
-        wc.hInstance = hinstance
-        wc.lpszClassName = _GRIP_CLASS
-        if not user32.RegisterClassExW(ctypes.byref(wc)):
-            if ctypes.get_last_error() != 1410:
-                debug.log("strip", "把手 RegisterClassEx 失败")
-                return
-        # 注意：**不带** WS_EX_TRANSPARENT（这正是它能收到鼠标的原因）
-        ex = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        for l, t, r, b in self._grip_rects():
-            hwnd = user32.CreateWindowExW(
-                ex, _GRIP_CLASS, "PowerMonitorStripGrip", WS_CHILD | WS_VISIBLE,
-                l, t, r - l, b - t, self._parent, None, hinstance, None,
-            )
-            if not hwnd:
-                debug.log("strip", f"把手 CreateWindowEx 失败 err={ctypes.get_last_error()}")
-                continue
-            _grips[hwnd] = self
-            self._grip_hwnds.append(hwnd)
-        self._grip_raise()
-
-    def _grip_destroy(self) -> None:
-        for hwnd in self._grip_hwnds:
-            _grips.pop(hwnd, None)
-            try:
-                user32.DestroyWindow(hwnd)
-            except Exception:  # noqa: BLE001
-                pass
-        self._grip_hwnds = []
-        self._grip_release()
-
-    def _grip_release(self) -> None:
-        if self._grip_dc:
-            if self._grip_old:
-                gdi32.SelectObject(self._grip_dc, self._grip_old)
-            if self._grip_bmp:
-                gdi32.DeleteObject(self._grip_bmp)
-            gdi32.DeleteDC(self._grip_dc)
-        self._grip_dc = None
-        self._grip_bmp = None
-        self._grip_old = None
-        self._grip_view = None
-        self._grip_w = self._grip_h = 0
-
-    def _grip_sync(self) -> None:
-        """把手跟着长条走（长条搬家 / 改大小之后都要调）。"""
-        if not self._grip_hwnds:
-            return
-        rects = self._grip_rects()
-        if len(rects) != len(self._grip_hwnds):
-            self._grip_create()
-            return
-        for hwnd, (l, t, r, b) in zip(self._grip_hwnds, rects):
-            user32.SetWindowPos(
-                hwnd, 0, l, t, r - l, b - t,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
-            )
-
-    def _grip_raise(self) -> None:
-        """把手压在长条之上（长条每次抢到 HWND_TOP 之后都要重申一次）。"""
-        for hwnd in self._grip_hwnds:
-            user32.SetWindowPos(
-                hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-            )
-
-    def _grip_visible(self, visible: bool) -> None:
-        for hwnd in self._grip_hwnds:
-            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE if visible else 0)
-
-    def _grip_render(self) -> None:
-        """把两列小圆点画进把手自己的分层位图。配色跟着长条这一帧的配色走。"""
-        pal = self._pal
-        if pal is None or not self._grip_hwnds or not self._rect:
-            return
-        left, top, right, bottom = self._rect
-        w, h = self._grip_size(self._scale, bottom - top)
-        if self._grip_view is None or self._grip_w != w or self._grip_h != h:
-            self._grip_release()
-            screen = user32.GetDC(None)
-            try:
-                self._grip_dc = gdi32.CreateCompatibleDC(screen)
-                self._grip_bmp, self._grip_view = dib_section(self._grip_dc, w, h)
-            finally:
-                user32.ReleaseDC(None, screen)
-            if not self._grip_bmp:
-                self._grip_release()
-                return
-            self._grip_old = gdi32.SelectObject(self._grip_dc, self._grip_bmp)
-            self._grip_w, self._grip_h = w, h
-        # 注意：把手整块只画点，别的地方 alpha=0（完全透明）—— 覆盖在胶囊上时
-        # 看到的就是长条自己的底色，不会多出一块「补丁」。
-        self._grip_paint(w, h, pal, self._drag is not None)
-        rects = self._grip_rects()
-        for hwnd, (l, t, _r, _b) in zip(self._grip_hwnds, rects):
-            present_layered(hwnd, self._grip_dc, w, h, l, t)
-
-    def _grip_paint(self, w: int, h: int, pal: dict, active: bool) -> None:
-        """2 列 × 3 行的小圆点（标准的「抓手」记号），逐像素算覆盖率做抗锯齿。"""
-        view = self._grip_view
-        if view is None or w <= 0 or h <= 0:
-            return
-        # 🔴 整块垫一层 alpha=2/255 的底，不能是 0。
-        #
-        # 分层窗口（UpdateLayeredWindow）的**命中测试是按像素 alpha 走的**：
-        # alpha=0 的地方鼠标直接穿过去。踩过的坑：一开始除圆点外全是 0，结果
-        # 只有圆点那一小撮能点到，把手其余位置 WindowFromPoint 返回的是
-        # Shell_TrayWnd —— 看着有把手，实际几乎抓不住。
-        # 2/255 ≈ 0.8% 的压暗，肉眼看不出来，但足以让整块把手可点。
-        view[:] = (b"\x00\x00\x00" + bytes((_GRIP_HIT_ALPHA,))) * (w * h)
-        color = pal["ink"] if active else pal["dim"]
-        cr, cg, cb = _unpack(color)
-        alpha_max = _GRIP_ALPHA_ACTIVE if active else _GRIP_ALPHA_IDLE
-        if alpha_max <= 0:
-            return
-        scale = self._scale or 1.0
-        radius = max(0.7, _GRIP_DOT_R * scale)
-        gap_x = _GRIP_DOT_GAP_X * scale
-        gap_y = _GRIP_DOT_GAP_Y * scale
-        cx = w / 2.0 - gap_x / 2.0
-        cy = h / 2.0 - gap_y
-        for col in (0, 1):
-            for row in (0, 1, 2):
-                px = cx + col * gap_x
-                py = cy + row * gap_y
-                x0 = max(0, int(px - radius - 1))
-                x1 = min(w, int(px + radius + 2))
-                y0 = max(0, int(py - radius - 1))
-                y1 = min(h, int(py + radius + 2))
-                for y in range(y0, y1):
-                    for x in range(x0, x1):
-                        dx = x + 0.5 - px
-                        dy = y + 0.5 - py
-                        dist = (dx * dx + dy * dy) ** 0.5
-                        cover = radius + 0.5 - dist
-                        if cover <= 0.0:
-                            continue
-                        alpha = int(round(alpha_max * min(1.0, cover)))
-                        # 分层窗口要的是**预乘** alpha（RGB 已经乘过 alpha）
-                        idx = (y * w + x) * 4
-                        view[idx] = cb * alpha // 255
-                        view[idx + 1] = cg * alpha // 255
-                        view[idx + 2] = cr * alpha // 255
-                        view[idx + 3] = alpha
 
     # ------------------------------------------------------------- 资源
 
@@ -990,12 +872,17 @@ class TaskbarStrip:
         必须算进 ``_content_key``：改质感 / 字号 / 尺寸 / 显示项都不会改变数值本身，
         只比数值的话 ``_render_if_needed`` 会认为「没变化」直接返回，
         用户点了半天菜单长条纹丝不动。
+
+        ``hover`` 也要算进来 —— 悬停是把描边换成强调色，属于「长什么样」，
+        不算的话鼠标指上去不会重画，那圈提示色永远不出现。
         """
         return (
             stripopts.theme(self.cfg),
             round(stripopts.font_scale(self.cfg), 3),
             stripopts.size_key(self.cfg),
             tuple(stripopts.enabled_fields(self.cfg)),
+            self._hover,
+            stripopts.locked(self.cfg),
         )
 
     def _content_key(self, snap) -> tuple:
@@ -1023,7 +910,9 @@ class TaskbarStrip:
                 # 时任务栏却因为「自动」主题 + 深色壁纸呈深色，读注册表会判断反，
                 # 结果就是在深色任务栏上画一条浅灰底黑字，非常突兀。
                 light = _luma(sample) >= 128
-        return _palette_for(theme, sample, light)
+        pal = _palette_for(theme, sample, light)
+        active = self._hover or self._drag is not None
+        return _apply_hover(pal, active) if active else pal
 
     # ------------------------------------------------------------- 位置
 
@@ -1543,20 +1432,19 @@ class TaskbarStrip:
         if self._should_hide():
             if not self._hidden:
                 user32.ShowWindow(self._hwnd, 0)
-                self._grip_visible(False)
+                self._hover = False
                 self._hidden = True
             return
 
         # 正在拖：位置由鼠标说了算，这一刻不要按锚点重算（否则会和手抢，抖）
         if self._drag is not None:
-            self._grip_sync()
             return
 
         target = self._target_rect(snap)
         if target is None:
             if not self._hidden:
                 user32.ShowWindow(self._hwnd, 0)
-                self._grip_visible(False)
+                self._hover = False
                 self._hidden = True
             return
 
@@ -1564,7 +1452,7 @@ class TaskbarStrip:
             user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
             self._hidden = False
             self._key = None
-            self._grip_visible(True)
+            self._leave_tracked = False
             # 刚从隐藏恢复，立刻把层级重新声明一次，避免被任务栏压到下面
             # （否则会出现「消失一下、过两秒才冒出来」的错觉）。
             self._ensure_above_siblings(force=True)
@@ -1577,7 +1465,6 @@ class TaskbarStrip:
             )
             self._rect = target
             self._key = None
-            self._grip_sync()
             debug.log("strip", f"移动到 {target}")
 
         self._ensure_above_siblings()
@@ -1632,7 +1519,6 @@ class TaskbarStrip:
             )
             # 把手再压一层：它也必须是「兄弟里最前」，否则会被长条的胶囊底盖住，
             # 小圆点就看不见了（长条是透明的，所以即使把手在下也还能点，只是不好看）
-            self._grip_raise()
         else:
             user32.SetWindowPos(
                 self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1733,5 +1619,3 @@ class TaskbarStrip:
         self._key = key
         # 把手要用这一帧的配色画小圆点（换质感 / 换深浅时跟着变），顺便对齐位置
         self._pal = pal
-        self._grip_sync()
-        self._grip_render()

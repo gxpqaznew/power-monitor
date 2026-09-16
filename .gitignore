@@ -16,6 +16,9 @@ debug.log
 # 离线渲染/截图的预览图
 _preview/
 
+# 设计参考素材（别人的截图，只用来比对审美，不要进仓库）
+_ref/
+
 # 系统/编辑器
 .DS_Store
 Thumbs.db

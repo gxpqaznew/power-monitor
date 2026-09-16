@@ -141,24 +141,32 @@ def check_alignment(strip) -> int:
         bad += 1
         print("[FAIL] 两行的分隔线不在同一批 x 上")
 
-    # 把手：建出来两块，而且真的能点到（命中测试按像素 alpha 走，见 strip._grip_paint）
-    grips = list(strip._grip_hwnds)
-    if len(grips) != 2:
+    # 拖动：不再有把手（两端那两列小圆点被否掉了），整块胶囊自己就是拖动面。
+    # 能拖的前提是窗口能收到鼠标消息 —— 分层窗口的命中测试按像素 alpha 走，
+    # 所以胶囊内部必须命中，圆角外那点必须穿过去（穿了才不挡任务栏的点击）。
+    if strip._interactive is not True:
         bad += 1
-        print(f"[FAIL] 拖动把手应为 2 块，实际 {len(grips)}")
-        return bad
-    hit = 0
-    for hwnd in grips:
-        r = w32.wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(r))
-        pt = w32.wintypes.POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-        if user32.WindowFromPoint(pt) == hwnd:
-            hit += 1
-    if hit == 2:
-        print("[PASS] 两块把手都能被鼠标点到（WindowFromPoint 命中）")
+        print("[FAIL] 长条默认不能拖（_interactive 应为 True）")
+    else:
+        print("[PASS] 长条默认可拖（没有「锁定位置」）")
+
+    rect = wintypes_rect(strip.hwnd)
+    mid_x = (rect[0] + rect[2]) // 2
+    mid_y = (rect[1] + rect[3]) // 2
+    hit = user32.WindowFromPoint(w32.wintypes.POINT(mid_x, mid_y))
+    if hit == strip.hwnd:
+        print("[PASS] 胶囊正中命中的就是长条（能抓）")
     else:
         bad += 1
-        print(f"[FAIL] 只有 {hit}/2 块把手能被点到")
+        print(f"[FAIL] 胶囊正中命中的不是长条（{hit:#x} vs {strip.hwnd:#x}）")
+
+    # 圆角外：贴着窗口左上角那一像素 —— alpha=0，鼠标应该穿过去
+    corner = user32.WindowFromPoint(w32.wintypes.POINT(rect[0], rect[1]))
+    if corner == strip.hwnd:
+        bad += 1
+        print("[FAIL] 圆角外面那点被长条吃了（会挡住任务栏点击）")
+    else:
+        print(f"[PASS] 圆角外面那点仍然穿透（命中 {corner:#x}）")
     return bad
 
 

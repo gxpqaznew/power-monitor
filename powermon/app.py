@@ -46,7 +46,7 @@ from .tray import (
     CMD_STATS,
     CMD_THEME_BASE,
     CMD_TOGGLE_AUTOSTART,
-    CMD_TOGGLE_GRIP,
+    CMD_TOGGLE_LOCK,
     CMD_TOGGLE_PANEL,
     CMD_TOGGLE_STRIP,
     CMD_VIEW_DAY_BASE,
@@ -211,6 +211,10 @@ class PowerMonitorApp:
         self.tray = TrayIcon(
             self._build_menu, self._on_command, self._on_extra_message
         )
+        # 长条默认能拖 → 它不再穿透点击 → 会把长条那一片任务栏的右键菜单吃掉。
+        # 所以让它右键时回调到托盘，把同一套菜单在原地弹出来（等于把「被吃掉」
+        # 的那次右键还回去，还多给了长条自己的设置入口）。
+        self.strip.menu_callback = self.tray.popup
         self._icon_key: tuple[str, int] | None = None
         self._timer_id = 0
         self._first_run = first_run
@@ -265,15 +269,15 @@ class PowerMonitorApp:
         return menu
 
     def _menu_position(self) -> "MenuBuilder":
-        """长条位置：拖动把手开关 + 位置复位。
+        """长条位置：锁定开关 + 位置复位。
 
-        长条本体是穿透点击的（不能吃掉任务栏右键菜单），所以拖动只能挂在两端
-        那两块 15px 的「把手」上 —— 关掉把手就等于关掉拖动，这里给个开关。
-        拖歪了不想手动拖回去，就用「位置复位」。
+        长条默认**能拖**（整块胶囊就是拖动面，鼠标指上去描边会转成强调色），
+        代价是它会吃掉那一片任务栏的点击。想要「看得见但完全摸不着」就勾上
+        「锁定位置」——那时长条加回穿透点击，鼠标直接穿过去。
         """
         menu = MenuBuilder.submenu()
-        menu.item(CMD_TOGGLE_GRIP, "拖动把手（两端的小圆点）",
-                  stripopts.grip_enabled(self.cfg))
+        menu.item(CMD_TOGGLE_LOCK, "锁定位置（穿透点击，不可拖动）",
+                  stripopts.locked(self.cfg))
         menu.item(CMD_POS_RESET, "位置复位（回到开始按钮左边）")
         return menu
 
@@ -445,8 +449,8 @@ class PowerMonitorApp:
             # 「查看某一天 / 某一次开机」也是区间命令，同样先吃掉
             if self._view_entry(cmd):
                 return None
-            if cmd == CMD_TOGGLE_GRIP:
-                self._toggle_grip()
+            if cmd == CMD_TOGGLE_LOCK:
+                self._toggle_lock()
                 return "position"
             if cmd == CMD_POS_RESET:
                 self._reset_strip_position()
@@ -535,12 +539,17 @@ class PowerMonitorApp:
         self.strip.invalidate()
         self._ensure_strip()
 
-    def _toggle_grip(self) -> None:
-        """开关长条两端的拖动把手（关掉就拖不动了）。"""
-        target = not stripopts.grip_enabled(self.cfg)
-        self.cfg.strip_grip = target
+    def _toggle_lock(self) -> None:
+        """锁定 / 解锁长条位置。
+
+        **不锁**（默认）= 长条能拖：鼠标指上去描边转强调色、光标变 ↔、按住横拖、
+        双击复位。**锁上** = 加回 ``WS_EX_TRANSPARENT``，长条变回完全穿透点击的
+        纯显示窗口（长条盖住的那片任务栏照样能点）。
+        """
+        target = not stripopts.locked(self.cfg)
+        self.cfg.strip_locked = target
         self.cfg.save()
-        self.strip.set_grip_enabled(target)
+        self.strip.set_interactive(not target)
 
     def _reset_strip_position(self) -> None:
         """把长条拖回默认位置（开始按钮左边）。"""
@@ -1063,6 +1072,7 @@ def self_test() -> int:
     #   * GDI 往 32bpp DIB 里画会把 alpha 直接清成 0，漏补一块，那一块在
     #     UpdateLayeredWindow 下就是透明空洞。
     from . import taskbar
+    from . import strip as strip_mod
     from .roundwin import compose_shape_alpha, dib_section
     from .strip import TaskbarStrip
 
@@ -1115,6 +1125,23 @@ def self_test() -> int:
             setattr(made, name, val)
         return made
 
+    def _hover_palette_differs() -> bool:
+        """悬停配色必须「只动描边 / 底色」——顺带守住「别再长出常驻装饰」。
+
+        检查两件事：① 悬停帧和普通帧的配色确实不一样（否则鼠标指上去毫无反应）；
+        ② 除了 ``border``/``border_w``/``bg`` 之外**没有别的键变化**，
+        也就是说悬停没有顺手改字色之类的东西（那种改动看起来会像画面在闪）。
+        """
+        made = config_mod.Config()
+        probe = TaskbarStrip(made)
+        normal = strip_mod._palette_for("dark", None, False)
+        hot = strip_mod._apply_hover(normal, True)
+        if hot["border"] == normal["border"]:
+            return False
+        changed = {k for k in normal if hot.get(k) != normal[k]}
+        allowed = {"border", "border_w", "bg"}
+        return changed <= allowed and probe is not None
+
     check("长条质感有 6 档", len(stripopts.THEMES) == 6,
           "、".join(stripopts.THEME_KEYS))
     # 6 档 = 常规 5 档 + 折行兜底的「极小」。多这一档是为了让「勾满 15 项」也
@@ -1159,18 +1186,22 @@ def self_test() -> int:
     # 会被夹住，而不是让长条飞到屏幕外面（用户会以为「长条不见了」）。
     check("不拖时偏移就是 0（默认落点）",
           abs(stripopts.offset_x(config_mod.Config())) < 1e-9)
-    check("把手默认是开的（没有把手就拖不动）",
-          stripopts.grip_enabled(config_mod.Config()) is True)
-    wild = _variant(strip_offset_x=1e9, strip_grip="yes")
-    check("手改出来的拖动偏移会被夹住、把手开关会转成布尔",
+    check("长条默认不锁（不锁才能拖，整块胶囊就是拖动面）",
+          stripopts.locked(config_mod.Config()) is False)
+    wild = _variant(strip_offset_x=1e9, strip_locked="yes")
+    check("手改出来的拖动偏移会被夹住、锁定开关会转成布尔",
           stripopts.sanitize(wild) is True
           and abs(wild.strip_offset_x - stripopts.OFFSET_LIMIT) < 1e-6
-          and wild.strip_grip is True,
-          f"{wild.strip_offset_x}/{wild.strip_grip}")
+          and wild.strip_locked is True,
+          f"{wild.strip_offset_x}/{wild.strip_locked}")
     junk = _variant(strip_offset_x="左边一点")
     check("偏移写成非数字时退回 0（不能让长条算不出位置）",
           stripopts.sanitize(junk) is True and junk.strip_offset_x == 0.0,
           repr(junk.strip_offset_x))
+    # 悬停提示：以前靠两端两列小圆点当抓手，用户嫌丑。现在不留任何常驻装饰，
+    # 悬停时才把描边转成强调色 —— 这两条守着「别把圆点加回来」和「悬停真的改变画面」。
+    check("悬停配色只改描边（不引入任何常驻装饰）",
+          _hover_palette_differs() is True)
 
     screen_dc = user32.GetDC(None)
     theme_dc = gdi32.CreateCompatibleDC(screen_dc)
@@ -1564,10 +1595,10 @@ def self_test() -> int:
     check("每一档都能反查出它属于哪级子菜单", all(found.values()), str(found))
     check("普通命令不会被当成选项（锚点为 None）",
           PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_RESET) is None)
-    # 「拖动把手 / 位置复位」是单号命令（不是档位），绝不能落进任何档位区间里 ——
+    # 「锁定位置 / 位置复位」是单号命令（不是档位），绝不能落进任何档位区间里 ——
     # 落了就会被 _apply_strip_option 提前吃掉，静默退化成「点了一下没反应」。
-    check("拖动把手 / 位置复位不会被当成档位命令",
-          PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_TOGGLE_GRIP) is None
+    check("锁定位置 / 位置复位不会被当成档位命令",
+          PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_TOGGLE_LOCK) is None
           and PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_POS_RESET) is None)
     built = [
         PowerMonitorApp._build_menu(_MenuProbe(), anchor)
@@ -1577,7 +1608,7 @@ def self_test() -> int:
           all(bool(handle) for handle in built),
           str([bool(handle) for handle in built]))
     pos_menu = built[PowerMonitorApp.STRIP_MENUS.index("position")]
-    check("长条位置子菜单有两个入口（把手开关 + 位置复位）",
+    check("长条位置子菜单有两个入口（锁定开关 + 位置复位）",
           int(user32.GetMenuItemCount(pos_menu)) == 2,
           f"{int(user32.GetMenuItemCount(pos_menu))} 项")
     root = PowerMonitorApp._build_menu(_MenuProbe(), PowerMonitorApp.ROOT_MENU)

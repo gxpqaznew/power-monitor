@@ -63,8 +63,8 @@ CMD_FONT_BASE = 60       # 60..69  长条字号（strippts.FONT_SCALES 下标）
 CMD_SIZE_BASE = 70       # 70..79  长条大小（strippts.SIZES 下标）
 CMD_FIELD_BASE = 80      # 80..99  长条显示内容（strippts.FIELDS 下标，勾选式）
 
-# 长条位置：拖动把手开关 + 位置复位。都不是「档位」，所以各给一个单独的号。
-CMD_TOGGLE_GRIP = 25
+# 长条位置：锁定开关 + 位置复位。都不是「档位」，所以各给一个单独的号。
+CMD_TOGGLE_LOCK = 25
 CMD_POS_RESET = 26
 
 # 「查看某一天 / 某一次开机」：菜单里直接列出最近若干条，点一条就跳到它的明细。
@@ -246,6 +246,15 @@ class TrayIcon:
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid))
 
     # ------------------------------------------------------------- 消息
+
+    def popup(self) -> None:
+        """在当前光标处弹出菜单。
+
+        长条默认不再穿透点击（要能拖），于是会把任务栏那一片的右键菜单吃掉 ——
+        所以长条收到右键时回调到这里，把菜单补上。位置由 ``_popup`` 自己取
+        ``GetCursorPos``，所以不用传坐标。
+        """
+        self._popup()
 
     def _on_message(self, msg, wparam, lparam):
         if msg == WM_TRAYICON:

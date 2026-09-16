@@ -35,6 +35,7 @@ CW_USEDEFAULT = -2147483648
 
 # GetWindowLong 偏移
 GWL_STYLE = -16
+GWL_EXSTYLE = -20
 
 # 显示
 SW_HIDE = 0
@@ -574,6 +575,9 @@ ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
 AC_SRC_ALPHA = 0x01
 SWP_NOOWNERZORDER = 0x0200
+# 让系统把「窗口样式 / 扩展样式变了」当回事，重新算一遍非客户区。
+# 运行期用 SetWindowLongPtrW 改 WS_EX_TRANSPARENT（长条「锁定位置」）必须带它。
+SWP_FRAMECHANGED = 0x0020
 
 
 class BLENDFUNCTION(ctypes.Structure):
@@ -596,7 +600,7 @@ user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetParent.argtypes = [wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
 
-# --- 长条拖动把手 ---
+# --- 长条拖动 ---
 # 光标：拖左右位置就该是「↔」，系统库里现成有（LoadCursorW 的 lpCursorName 是
 # MAKEINTRESOURCE，把整数当指针传）。
 IDC_SIZEWE = 32644
@@ -605,10 +609,39 @@ user32.SetCursor.argtypes = [wintypes.HANDLE]
 user32.SetCursor.restype = wintypes.HANDLE
 user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 user32.SetCursorPos.restype = wintypes.BOOL
-# 命中测试：问系统「屏幕这一点上是哪个窗口」。验证「长条中间穿透、两端把手能抓」
+# 命中测试：问系统「屏幕这一点上是哪个窗口」。验证「胶囊能抓、圆角外仍然穿透」
 # 全靠它 —— 比真的动鼠标安全得多（不打扰用户正在用的桌面）。
 user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
+
+# 枚举子窗口。长条是任务栏的**子窗口**，EnumWindows 看不到它（那个只枚举顶层），
+# 要顺着 Shell_TrayWnd 往下走必须用这个。
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+user32.EnumChildWindows.restype = wintypes.BOOL
+
+# WM_SETCURSOR 的 lparam 低 16 位：命中测试码。只有 HTCLIENT 才该改光标，
+# 落在边框/标题栏上改了就变成「光标自己乱闪」。
+HTCLIENT = 1
+
+# 悬停：Windows 只在鼠标「动」的时候发 WM_MOUSEMOVE，鼠标静止不动时不会重发；
+# 要拿到「离开」通知必须先用 TrackMouseEvent 登记一次 TME_LEAVE，之后系统会补一条
+# WM_MOUSELEAVE。不登记的话悬停高亮会一直亮着不灭。
+WM_MOUSELEAVE = 0x02A3
+TME_LEAVE = 0x00000002
+
+
+class TRACKMOUSEEVENT(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("hwndTrack", wintypes.HWND),
+        ("dwHoverTime", wintypes.DWORD),
+    ]
+
+
+user32.TrackMouseEvent.argtypes = [ctypes.POINTER(TRACKMOUSEEVENT)]
+user32.TrackMouseEvent.restype = wintypes.BOOL
 
 
 def int_resource(value: int):

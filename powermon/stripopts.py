@@ -161,13 +161,15 @@ def enabled_fields(cfg) -> list[str]:
     return keys or list(DEFAULT_FIELDS)
 
 
-def grip_enabled(cfg) -> bool:
-    """长条两端要不要留拖动把手。
+def locked(cfg) -> bool:
+    """长条要不要「锁定位置」。
 
-    默认开 —— 没有把手就拖不动长条（长条本体是穿透点击的，收不到鼠标）。
+    默认**不锁**：长条自己就能拖（整块胶囊是拖动面，悬停会出强调色描边）。
+    勾上之后长条加回 ``WS_EX_TRANSPARENT``，变成纯显示、完全穿透点击 ——
+    给「长条压着的地方我要点任务栏」的人用。
     """
-    value = getattr(cfg, "strip_grip", True)
-    return bool(value) if isinstance(value, (bool, int)) else True
+    value = getattr(cfg, "strip_locked", False)
+    return bool(value) if isinstance(value, bool) else False
 
 
 def offset_x(cfg) -> float:
@@ -286,11 +288,11 @@ def sanitize(cfg) -> bool:
         cfg.strip_fields = keys
         changed = True
 
-    # 拖动把手开关 / 拖动量：手改 config.json 写成 "1e9" 之类会让长条飞到天边，
+    # 锁定开关 / 拖动量：手改 config.json 写成 "1e9" 之类会让长条飞到天边，
     # 统一在这儿夹回合法值（真正的边界在 strip._target_rect 里按屏幕再夹一次）。
-    raw_grip = getattr(cfg, "strip_grip", True)
-    if not isinstance(raw_grip, bool):
-        cfg.strip_grip = bool(raw_grip)
+    raw_locked = getattr(cfg, "strip_locked", False)
+    if not isinstance(raw_locked, bool):
+        cfg.strip_locked = bool(raw_locked)
         changed = True
 
     raw_offset = getattr(cfg, "strip_offset_x", 0.0)

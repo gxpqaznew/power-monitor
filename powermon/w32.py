@@ -52,6 +52,7 @@ HWND_NOTOPMOST = wintypes.HWND(-2)
 
 # 消息
 WM_DESTROY = 0x0002
+WM_KILLFOCUS = 0x0008   # 自绘菜单靠它判断「点了别处」
 WM_CLOSE = 0x0010
 WM_QUIT = 0x0012
 WM_PAINT = 0x000F
@@ -601,9 +602,10 @@ user32.GetParent.argtypes = [wintypes.HWND]
 user32.GetParent.restype = wintypes.HWND
 
 # --- 长条拖动 ---
-# 光标：拖左右位置就该是「↔」，系统库里现成有（LoadCursorW 的 lpCursorName 是
-# MAKEINTRESOURCE，把整数当指针传）。
+# 光标：拖左右位置就该是「↔」，拖上下边缘改大小就该是「↕」，
+# 系统库里现成有（LoadCursorW 的 lpCursorName 是 MAKEINTRESOURCE，把整数当指针传）。
 IDC_SIZEWE = 32644
+IDC_SIZENS = 32645
 IDC_HAND = 32649
 user32.SetCursor.argtypes = [wintypes.HANDLE]
 user32.SetCursor.restype = wintypes.HANDLE
@@ -625,6 +627,17 @@ user32.EnumChildWindows.restype = wintypes.BOOL
 # 否则旧版进程在线就会让断言永远 FAIL —— 一条修不掉的假警报。
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+# 菜单类 popup 的焦点管理：自绘菜单要靠 KILLFOCUS 判断「点别处关闭」，
+# 非前台进程抢前台要用 AttachThreadInput 附着到当前前台线程再 SetForegroundWindow。
+user32.GetFocus.argtypes = []
+user32.GetFocus.restype = wintypes.HWND
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+user32.ScreenToClient.restype = wintypes.BOOL
 
 # WM_SETCURSOR 的 lparam 低 16 位：命中测试码。只有 HTCLIENT 才该改光标，
 # 落在边框/标题栏上改了就变成「光标自己乱闪」。

@@ -35,6 +35,11 @@
   代价是长条不再穿透点击，所以托盘菜单里给了一个「锁定位置（穿透点击）」的开关，
   锁上就恢复成完全看不见摸不着的纯显示窗口。
 
+**改大小**。光标落进胶囊**上下边缘带**（各 4px）时光标变 ↕，按住竖拖就是
+无级缩放字号（0.60~1.60，菜单里那六档只是快捷取值）：向上拖变大、向下拖
+变小，拖动中实时重排但不落盘，松手才写 ``cfg.strip_font_scale``（连续值，
+``stripopts`` 会原样接受）。想回 1.0：字号菜单底部有「复位标准字号」。
+
   ⚠️ 分层窗口的**命中测试是按像素 alpha 走的**：胶囊内部的 alpha 是 255，
   四个圆角外面和阴影那一圈是 0，于是「胶囊能抓、圆角外照样穿透」是天然成立的，
   不需要额外做什么。反过来，如果哪天为了好看把整块画布的 alpha 都垫高，
@@ -68,6 +73,7 @@ from .w32 import (
     GWL_STYLE,
     HTCLIENT,
     HWND_TOPMOST,
+    IDC_SIZENS,
     IDC_SIZEWE,
     NULL_BRUSH,
     PS_SOLID,
@@ -128,6 +134,17 @@ _CS_DBLCLKS = 0x0008
 # 拖动 / 悬停需要鼠标消息，所以默认**不带** WS_EX_TRANSPARENT；
 # 「锁定位置」时才加回去（见 set_interactive）。
 _EX_BASE = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
+
+# ---- 拖边缘改大小（resize）----
+# 胶囊上下各一条这么厚的「边缘带」：光标进去变 ↕，按住竖拖就是无级缩放字号。
+# 取 4（设计基准像素）：再薄点不中，再厚会吃掉太多「横向拖」的区域。
+_EDGE_PX = 4.0
+# 竖拖一整个任务栏高度（设计基准 48px）≈ 字号变这么多。0.5 的手感是「拖一下
+# 明显变大、但不会一碰就飞」。
+_RESIZE_RATE = 0.5
+# 字号变化小于这个就不重排：SDF 合成是逐像素的 Python 循环，每一帧都全量
+# 重画会掉帧；0.02 的步长在视觉上是连续的（高度每 0.02 才跳一丝）。
+_RESIZE_STEP = 0.02
 
 # 设计基准：任务栏高度 48px 时的那套尺寸。真实尺寸按任务栏高度等比缩放，
 # 这样用户改「任务栏大小」或换 DPI 时长条会跟着变，不会显得突兀。
@@ -470,6 +487,14 @@ class TaskbarStrip:
         # 之后每个 WM_MOUSEMOVE 只算增量 —— 用增量而不是绝对位置，长条跟着光标走
         # 时不会因为「窗口移动 → 客户区坐标跟着变」而产生反馈自激。
         self._drag: dict | None = None
+        # 缩放（resize）中的状态。按住胶囊**上下边缘**竖拖 = 无级改字号：
+        # 里面记着按下时的光标 y 与当时的字号，之后每个 WM_MOUSEMOVE 只算增量。
+        # 与横向拖动共用「按下即捕获」的套路，但改的是字号不是位置。
+        self._resize: dict | None = None
+        # resize 拖动中临时生效的字号（cfg 还没写，松手才落盘）。
+        # None = 用 cfg 里的值。渲染 / 测宽 / 定高都走 ``_font_scale()``，
+        # 它先查这个覆盖值 —— 拖的时候长条才会跟着手指实时变大变小。
+        self._resize_scale: float | None = None
         # 用户拖出来的横向偏移（设计基准像素；None = 还没跟 cfg 同步过）
         self._offset_nominal: float | None = None
         # 默认落点（不含拖动偏移）的屏幕 x。拖动时把「想去的 x」换算成偏移量要用它。
@@ -546,6 +571,8 @@ class TaskbarStrip:
 
     def destroy(self) -> None:
         self._drag = None
+        self._resize = None
+        self._resize_scale = None
         self._leave_tracked = False
         self._hover = False
         if self._hwnd:
@@ -581,25 +608,38 @@ class TaskbarStrip:
             # lparam 低 16 位是命中测试码：只有落在客户区才改光标，
             # 边框 / 标题栏上也改的话光标会自己乱闪。
             if (int(lparam) & 0xFFFF) == HTCLIENT and self._interactive:
-                user32.SetCursor(user32.LoadCursorW(None, int_resource(IDC_SIZEWE)))
+                # 上下边缘带里给 ↕（竖拖 = 改大小），其余区域给 ↔（横拖 = 挪位置）
+                cur = IDC_SIZENS if self._cursor_on_edge() else IDC_SIZEWE
+                user32.SetCursor(user32.LoadCursorW(None, int_resource(cur)))
                 return True, 1
             return False, 0
         if msg == WM_MOUSEMOVE:
-            if self._drag is not None:
+            if self._resize is not None:
+                self._resize_move()
+            elif self._drag is not None:
                 self._drag_move()
             elif self._interactive:
                 self._set_hover(True)
             return False, 0
         if msg == WM_MOUSELEAVE:
             self._leave_tracked = False
-            if self._drag is None:
+            if self._drag is None and self._resize is None:
                 self._set_hover(False)
             return False, 0
         if msg == WM_LBUTTONDOWN:
-            self._drag_start(self._hwnd)
+            # 按下的 y 落在上下边缘带里 = 改大小，否则 = 挪位置
+            y = (int(lparam) >> 16) & 0xFFFF
+            if y >= 0x8000:
+                y -= 0x10000
+            if self._on_edge(y):
+                self._resize_start(self._hwnd)
+            else:
+                self._drag_start(self._hwnd)
             return True, 0
         if msg == WM_LBUTTONUP:
-            if self._drag is not None:
+            if self._resize is not None:
+                self._resize_end()
+            elif self._drag is not None:
                 self._drag_end()
             return True, 0
         if msg == WM_LBUTTONDBLCLK:
@@ -617,6 +657,8 @@ class TaskbarStrip:
             return True, 0
         if msg == WM_CAPTURECHANGED:
             # 捕获被系统抢走（Alt+Tab / 弹窗）：当成松手，别让长条继续黏着鼠标
+            if self._resize is not None:
+                self._resize_end()
             if self._drag is not None:
                 self._drag_end()
             return False, 0
@@ -651,6 +693,8 @@ class TaskbarStrip:
         SWP_FRAMECHANGED 让系统重新算一遍窗口的非客户区，否则改动可能不生效。
         """
         self._drag = None
+        self._resize = None
+        self._resize_scale = None
         self._leave_tracked = False
         self._hover = False
         if not self._hwnd:
@@ -747,6 +791,110 @@ class TaskbarStrip:
             self.cfg.save()
         except Exception:  # noqa: BLE001 - 存盘失败不该影响拖动本身
             pass
+
+    # ---------------------------------------------------- 拖上下边缘改大小
+    #
+    # 与「横拖挪位置」互补：光标落在胶囊上下边缘带里时变 ↕，按住竖拖就是
+    # 无级缩放字号（0.60 ~ 1.60，菜单里那六档只是它的快捷取值）。
+    # 向上拖变大、向下拖缩小；拖动过程中**不落盘**，松手才写 cfg。
+
+    def _edge_band(self) -> float:
+        return _EDGE_PX * (self._scale or 1.0)
+
+    def _on_edge(self, y: float) -> bool:
+        """客户区 y 是不是落在上下边缘带里。"""
+        if not self._rect:
+            return False
+        h = self._rect[3] - self._rect[1]
+        band = self._edge_band()
+        return y < band or y >= h - band
+
+    def _cursor_on_edge(self) -> bool:
+        """当前光标（屏幕坐标）换算到客户区后，是不是在边缘带里。"""
+        pt = wintypes.POINT()
+        if not self._hwnd or not user32.GetCursorPos(ctypes.byref(pt)):
+            return False
+        if not user32.ScreenToClient(self._hwnd, ctypes.byref(pt)):
+            return False
+        return self._on_edge(pt.y)
+
+    def _font_scale(self) -> float:
+        """当前生效的字号：resize 拖动中用手指拖出来的值，否则用配置。"""
+        if self._resize_scale is not None:
+            return self._resize_scale
+        return stripopts.font_scale(self.cfg)
+
+    def _height_ratio(self) -> float:
+        """胶囊高度 / 任务栏高度。resize 拖动中跟着临时字号走，长条实时变高变矮。"""
+        if self._resize_scale is None:
+            return stripopts.height_ratio(self.cfg)
+        ratio, _pad = stripopts.size_spec(self.cfg)
+        return min(0.98, ratio * (0.74 + 0.26 * self._resize_scale))
+
+    def _resize_start(self, hwnd) -> None:
+        if not self._rect:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        self._resize = {"cursor": pt.y, "scale0": stripopts.font_scale(self.cfg)}
+        self._resize_scale = self._resize["scale0"]
+        user32.SetCapture(hwnd)
+        # 缩放期间保持「激活」外观（光标可能被甩出窗口，别让高亮闪掉）
+        self._set_hover(True)
+        debug.log("strip",
+                  f"开始缩放 scale0={self._resize['scale0']:.2f} cursor_y={pt.y}")
+
+    def _resize_move(self) -> None:
+        rs = self._resize
+        if rs is None or not self._hwnd:
+            return
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        scale = self._scale or 1.0
+        # 向上拖变大：dy = 按下时的 y − 现在的 y，换成设计基准像素后按比例映射。
+        dy = (rs["cursor"] - pt.y) / scale
+        want = rs["scale0"] + dy / _NOMINAL_TASKBAR_H * _RESIZE_RATE
+        want = max(stripopts.FONT_SCALE_MIN,
+                   min(stripopts.FONT_SCALE_MAX, want))
+        if self._resize_scale is not None and \
+                abs(want - self._resize_scale) < _RESIZE_STEP:
+            return                      # 变化太小：重排是逐像素合成，省一帧是一帧
+        self._resize_scale = want
+        # 字号变 → 内容高度变 → 窗口位置 / 尺寸都要重算，内容也要重画
+        self._key = None
+        self._relayout()
+
+    def _relayout(self) -> None:
+        """按当前（可能正被拖着的）字号重排一次：搬窗口 + 重画。"""
+        target = self._target_rect(self._last_snap)
+        if target is not None and target != self._rect:
+            cl, ct, cr, cb = self._client_rect(target)
+            user32.SetWindowPos(
+                self._hwnd, None, cl, ct, cr - cl, cb - ct,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )
+            self._rect = target
+        self._render_if_needed(self._last_snap)
+
+    def _resize_end(self) -> None:
+        rs = self._resize
+        final = self._resize_scale
+        self._resize = None
+        self._resize_scale = None
+        user32.ReleaseCapture()
+        if rs is not None and final is not None:
+            final = round(final, 3)
+            if abs(stripopts.font_scale(self.cfg) - final) > 1e-6:
+                try:
+                    self.cfg.strip_font_scale = final
+                    self.cfg.save()
+                except Exception:  # noqa: BLE001 - 存盘失败不该影响松手后的重排
+                    pass
+        self._key = None
+        self._render_if_needed(self._last_snap)
+        debug.log("strip", f"缩放结束 scale={final}")
 
     # ------------------------------------------------------------- 资源
 
@@ -878,7 +1026,7 @@ class TaskbarStrip:
         """
         return (
             stripopts.theme(self.cfg),
-            round(stripopts.font_scale(self.cfg), 3),
+            round(self._font_scale(), 3),
             stripopts.size_key(self.cfg),
             tuple(stripopts.enabled_fields(self.cfg)),
             self._hover,
@@ -931,7 +1079,7 @@ class TaskbarStrip:
         self._scale = scale
         # 单行高度由「尺寸」档位决定，字号大了再往上抬一点（大了要更多行高，
         # 否则字会被上下切掉）。默认档 = 0.78，和以前一样。
-        base_height = max(18, int(round(bar_h * stripopts.height_ratio(self.cfg))))
+        base_height = max(18, int(round(bar_h * self._height_ratio())))
         # 折行时允许长高（最多到任务栏的 0.94），但不会比单行矮 ——
         # 「尺寸」档位依然是单行时的外观契约，不会被折行偷偷改掉。
         self._max_height = max(base_height,
@@ -1015,7 +1163,7 @@ class TaskbarStrip:
         收缩上限：内容本来就窄、够不到上限，缩了只是白白少一份余量。
         """
         base = _MAX_WIDTH_TRAY if self._anchor_kind == "tray" else _MAX_WIDTH
-        font_mult = max(1.0, stripopts.font_scale(self.cfg))
+        font_mult = max(1.0, self._font_scale())
         return base * scale * font_mult
 
     def _measure_width(self, scale: float, snap) -> int:
@@ -1249,7 +1397,7 @@ class TaskbarStrip:
         几项 —— 否则「调字号没反应」比「少显示一项」更让人费解。同理，第 0 档
         密度是外观契约，只有前面全部失败才会动到标签和间距。
         """
-        base_font = stripopts.font_scale(self.cfg)
+        base_font = self._font_scale()
         smaller = [v for v in reversed(stripopts.FONT_SCALE_VALUES) if v < base_font]
         pad_mult = stripopts.size_spec(self.cfg)[1]
         pad_x = _PAD_X * scale * pad_mult

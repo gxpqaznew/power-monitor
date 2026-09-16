@@ -46,6 +46,12 @@ FONT_SCALES = [
 FONT_SCALE_VALUES = tuple(v for v, _ in FONT_SCALES)
 FONT_SCALE_LABEL = {v: t for v, t in FONT_SCALES}
 
+# 连续字号的合法区间：菜单上只有六档，但**拖长条上下边缘可以无级缩放**
+# （见 strip.py 的 resize），所以任何落在区间里的值都是合法的，
+# 不要再把连续值夹回最近的档位 —— 否则用户刚拖好的大小下一秒就被「校正」回去。
+FONT_SCALE_MIN = 0.60
+FONT_SCALE_MAX = 1.60
+
 # ------------------------------------------------------------------ 尺寸
 # (key, 菜单文字, 高度占任务栏比例, 左右内边距倍数)
 SIZES = [
@@ -124,10 +130,9 @@ def font_scale(cfg) -> float:
         value = float(getattr(cfg, "strip_font_scale", 1.0))
     except (TypeError, ValueError):
         return 1.0
-    if value in FONT_SCALE_VALUES:
-        return value
-    # 手改 config.json 写了个菜单里没有的值：夹到最近的档位
-    return min(FONT_SCALE_VALUES, key=lambda v: abs(v - value))
+    # 档位之外的连续值也是合法的：拖长条上下边缘就是在这个区间里无级缩放。
+    # 只有越界（或手改成 9.9 这种）才夹回边界。
+    return max(FONT_SCALE_MIN, min(FONT_SCALE_MAX, value))
 
 
 def size_key(cfg) -> str:

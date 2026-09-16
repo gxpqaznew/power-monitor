@@ -33,6 +33,7 @@ from .tray import (
     CMD_FEE_SETTINGS,
     CMD_FIELD_BASE,
     CMD_FONT_BASE,
+    CMD_FONT_RESET,
     CMD_MODE_AVERAGE,
     CMD_MODE_COST,
     CMD_MODE_CURRENT,
@@ -240,21 +241,34 @@ class PowerMonitorApp:
         menu = MenuBuilder.submenu()
         active = stripopts.theme(self.cfg)
         for i, (key, label, _hint) in enumerate(stripopts.THEMES):
-            menu.item(CMD_THEME_BASE + i, label, key == active)
+            menu.item(CMD_THEME_BASE + i, label, key == active, radio=True)
         return menu
 
     def _menu_font(self) -> "MenuBuilder":
+        """长条字号：六档快捷取值 + 复位。
+
+        档位只是快捷键 —— 拖长条上下边缘能把字号调成**任意连续值**
+        （0.60~1.60），所以菜单里如果当前值不在六档上，把它显示出来
+        （不然用户看着六个都没勾，以为坏了），并给一键复位。
+        """
         menu = MenuBuilder.submenu()
         active = stripopts.font_scale(self.cfg)
+        in_scale = any(abs(value - active) < 1e-6
+                       for value, _label in stripopts.FONT_SCALES)
         for i, (value, label) in enumerate(stripopts.FONT_SCALES):
-            menu.item(CMD_FONT_BASE + i, label, abs(value - active) < 1e-6)
+            menu.item(CMD_FONT_BASE + i, label, abs(value - active) < 1e-6,
+                      radio=True)
+        menu.separator()
+        if not in_scale:
+            menu.label("当前字号（拖长条边缘微调）", f"{active:.2f}")
+        menu.item(CMD_FONT_RESET, "复位标准字号（1.00）")
         return menu
 
     def _menu_size(self) -> "MenuBuilder":
         menu = MenuBuilder.submenu()
         active = stripopts.size_key(self.cfg)
         for i, (key, label, _ratio, _pad) in enumerate(stripopts.SIZES):
-            menu.item(CMD_SIZE_BASE + i, label, key == active)
+            menu.item(CMD_SIZE_BASE + i, label, key == active, radio=True)
         return menu
 
     def _menu_field(self) -> "MenuBuilder":
@@ -455,6 +469,10 @@ class PowerMonitorApp:
             if cmd == CMD_POS_RESET:
                 self._reset_strip_position()
                 return None
+            if cmd == CMD_FONT_RESET:
+                # 拖边缘把字号调飞了一键拉回 1.00；菜单留在那级方便再选
+                self._set_strip_option("font", 1.0)
+                return "font"
             if cmd == CMD_TOGGLE_PANEL:
                 self._toggle_panel()
             elif cmd in _MODE_BY_CMD:
@@ -1173,13 +1191,24 @@ def self_test() -> int:
           order.strip_fields == ["current", "cpu", "uptime"], str(order.strip_fields))
     bad = _variant(strip_theme="neon", strip_size="huge", strip_font_scale=9.0,
                    strip_fields=["nope"])
-    # 字号是「夹到最近的合法档」，不是重置成默认 —— 9.0 最近的是 1.5（巨大）。
-    # 关键是别让一个手改出来的离谱值把长条撑爆。
+    # 字号是连续值（拖边缘能调出任意 0.60~1.60），「夹」就是夹进区间 ——
+    # 9.0 夹到上限 1.60。关键是别让一个手改出来的离谱值把长条撑爆。
     check("手改出来的非法配置能夹回合法档",
           stripopts.sanitize(bad) is True and bad.strip_theme == "auto"
-          and bad.strip_size == "normal" and bad.strip_font_scale == 1.5
+          and bad.strip_size == "normal"
+          and bad.strip_font_scale == stripopts.FONT_SCALE_MAX
           and bad.strip_fields == list(stripopts.DEFAULT_FIELDS),
           f"{bad.strip_theme}/{bad.strip_size}/{bad.strip_font_scale}/{bad.strip_fields}")
+    too_small = _variant(strip_font_scale=0.05)
+    check("手改出来的过小字号夹到下限 0.60",
+          stripopts.sanitize(too_small) is True
+          and too_small.strip_font_scale == stripopts.FONT_SCALE_MIN,
+          f"{too_small.strip_font_scale}")
+    continuous = _variant(strip_font_scale=1.17)
+    check("连续字号（拖边缘调出来的）是合法值、不被夹回档位",
+          stripopts.sanitize(continuous) is False
+          and abs(continuous.strip_font_scale - 1.17) < 1e-9,
+          f"{continuous.strip_font_scale}")
 
     # ---- 拖动（长条位置）：偏移的合法性与折行表格 ----
     # 拖动量是用户拖出来的，手改 config.json 能写成任何东西；这里保证离谱的值
@@ -1600,6 +1629,8 @@ def self_test() -> int:
     check("锁定位置 / 位置复位不会被当成档位命令",
           PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_TOGGLE_LOCK) is None
           and PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_POS_RESET) is None)
+    check("字号复位不会被当成档位命令（单号，且字号档位区间不含它）",
+          PowerMonitorApp._apply_strip_option(_MenuProbe(), CMD_FONT_RESET) is None)
     built = [
         PowerMonitorApp._build_menu(_MenuProbe(), anchor)
         for anchor in PowerMonitorApp.STRIP_MENUS
@@ -1611,6 +1642,17 @@ def self_test() -> int:
     check("长条位置子菜单有两个入口（锁定开关 + 位置复位）",
           int(user32.GetMenuItemCount(pos_menu)) == 2,
           f"{int(user32.GetMenuItemCount(pos_menu))} 项")
+    font_menu = built[PowerMonitorApp.STRIP_MENUS.index("font")]
+    # 六档 + 分隔线 + 复位 = 8 项（当前值不在档位上时再多一条只读行）
+    font_entries = MenuBuilder.entries_of(font_menu) or []
+    check("字号子菜单尾部有「复位标准字号」入口",
+          any(e.get("cmd") == CMD_FONT_RESET for e in font_entries
+              if e.get("type") == "item"),
+          f"{len(font_entries)} 行")
+    check("字号六档都标成 radio（单选视觉）",
+          all(e.get("radio") for e in font_entries
+              if e.get("type") == "item" and e.get("cmd", 0) >= CMD_FONT_BASE),
+          "存在非 radio 的字号档")
     root = PowerMonitorApp._build_menu(_MenuProbe(), PowerMonitorApp.ROOT_MENU)
     check("整张根菜单也能为「继续弹」重建（顶层勾选式开关用）",
           bool(root) and PowerMonitorApp.ROOT_MENU not in PowerMonitorApp.STRIP_MENUS)

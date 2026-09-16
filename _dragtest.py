@@ -89,6 +89,20 @@ def send(hwnd, msg, wparam=0, lparam=0):
     return user32.SendMessageW(hwnd, msg, wparam, lparam)
 
 
+def lp(x: int, y: int) -> int:
+    """按下消息的 lparam：x/y 是**客户区**坐标。
+
+    y=0 现在会落进「顶边缘带」（拖上下边缘 = 改字号），所以横拖测试必须把
+    按下点放在胶囊**中间**，否则一进的就是缩放分支而不是拖动分支。
+    """
+    return (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+
+
+def mid_lparam(strip) -> int:
+    l, t, r, b = strip._rect
+    return lp((r - l) // 2, (b - t) // 2)
+
+
 def taskbar_descendants(pid_only: int | None = None) -> list[tuple[int, str]]:
     """任务栏整棵子树（含深层）的 (hwnd, 类名)。
 
@@ -203,7 +217,7 @@ def main() -> int:
         before = strip._rect
         drag_px = 120
         user32.SetCursorPos(cx, cy)
-        send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+        send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, mid_lparam(strip))
         check("按下胶囊进入拖动状态", strip._drag is not None)
         user32.SetCursorPos(cx + drag_px, cy)
         send(strip.hwnd, WM_MOUSEMOVE, MK_LBUTTON, 0)
@@ -233,7 +247,7 @@ def main() -> int:
         # ---- G. 拖过头要夹住 ----
         cx2, cy2 = center(strip.hwnd)
         user32.SetCursorPos(cx2, cy2)
-        send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+        send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, mid_lparam(strip))
         user32.SetCursorPos(-4000, cy2)
         send(strip.hwnd, WM_MOUSEMOVE, MK_LBUTTON, 0)
         far_left = strip._rect
@@ -246,7 +260,7 @@ def main() -> int:
         if tray is not None:
             cx3, cy3 = center(strip.hwnd)
             user32.SetCursorPos(cx3, cy3)
-            send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, 0)
+            send(strip.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, mid_lparam(strip))
             user32.SetCursorPos(screen[2] + 2000, cy3)
             send(strip.hwnd, WM_MOUSEMOVE, MK_LBUTTON, 0)
             far_right = strip._rect
@@ -283,10 +297,15 @@ def main() -> int:
               f"{unlocked_hit:#x}")
 
         # ---- 换个实例（= 重启程序）位置还在 ----
-        # 注意偏移要挑一个**夹不到**的值：默认落点离屏幕左边只有一百来像素，
-        # 写 -150 会被左边的夹取吃掉，测出来的就不是「配置接没接手」了。
+        # 偏移必须挑一个**夹不到**的值：左夹线是 screen+8，而默认落点
+        # （base_left）随内容宽度变 —— 字段多胶囊宽、落点就靠左。按这次
+        # 实际的落点动态算一个安全偏移，别写死（写 -60 在 base_left=75
+        # 时已经越过左夹线，测出来的就不是「配置接没接手」了）。
         strip._offset_nominal = None          # 清掉内存里的临时值，逼它重新读配置
-        cfg.strip_offset_x = -60.0
+        scale_now = strip._scale or 1.0
+        room = strip._base_left - 8 - 30      # 离左夹线再留 30px 余量
+        safe_offset = -min(60.0, max(10.0, room / scale_now))
+        cfg.strip_offset_x = safe_offset
         cfg.save()
         strip.destroy()
         strip2 = TaskbarStrip(cfg)
@@ -294,7 +313,7 @@ def main() -> int:
         try:
             if strip2.create(snap2):
                 strip2.tick(snap2)
-                want = -60.0 * (strip2._scale or 1.0)
+                want = safe_offset * (strip2._scale or 1.0)
                 delta = strip2._rect[0] - strip2._base_left
                 check("重开一个实例位置还在（偏移从配置接手）",
                       abs(delta - int(round(want))) <= 2,

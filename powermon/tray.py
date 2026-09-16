@@ -66,6 +66,9 @@ CMD_FIELD_BASE = 80      # 80..99  长条显示内容（strippts.FIELDS 下标�
 # 长条位置：锁定开关 + 位置复位。都不是「档位」，所以各给一个单独的号。
 CMD_TOGGLE_LOCK = 25
 CMD_POS_RESET = 26
+# 长条字号「复位标准」：拖边缘能把字号调成任意连续值（0.60~1.60），菜单里
+# 六档只是快捷取值，所以给一个一键回 1.00 的单独号（同样不是档位区间）。
+CMD_FONT_RESET = 27
 
 # 「查看某一天 / 某一次开机」：菜单里直接列出最近若干条，点一条就跳到它的明细。
 # 用户的原话是「能不能让用户在菜单里可以自主选择某一天去看……你这样对用户来说
@@ -259,6 +262,10 @@ class TrayIcon:
     def _on_message(self, msg, wparam, lparam):
         if msg == WM_TRAYICON:
             event = lparam & 0xFFFF
+            # 托盘图标的点击**不产生窗口焦点事件**，开着的菜单收不到
+            # WM_KILLFOCUS —— 所以任何一次托盘点击都先把旧菜单关掉。
+            from . import ctxmenu
+            ctxmenu.close_all()
             if event == WM_LBUTTONUP:
                 self._on_command(CMD_TOGGLE_PANEL)
             elif event == WM_RBUTTONUP:
@@ -279,71 +286,106 @@ class TrayIcon:
 
         return False, 0
 
-    def _popup(self, anchor: str | None = None) -> None:
-        """弹出菜单，并支持「选项类」子菜单连着点。
+    def _popup(self, anchor: str | None = None, origin=None) -> None:
+        """弹出自绘菜单（ctxmenu 的深色卡片）。
 
-        Win32 的弹出菜单**选中一项就必然关闭** —— 这是系统行为，改不了。而
-        「长条显示内容」是勾选式的，用户往往要连着勾三四项，每次都得回托盘重新
-        右键，非常烦。所以这里用「同一位置重新弹同一个子菜单」来模拟「菜单不关」：
+        早先用 ``TrackPopupMenu`` —— 灰色经典样式改不了色，用户原话「右键菜单栏
+        也有点丑」。现在渲染交给 ctxmenu，这里只剩两件事：
 
-            build_menu(anchor) 传入锚点 → 只返回那一级子菜单（重建过，勾选状态是新的）
-            on_command(cmd) 的返回值就是下一个要继续弹的锚点，返回 None 表示正常关闭
+        * 把 ``build_menu(anchor)`` 建出来的结构（MenuBuilder.entries）递过去；
+        * 「点完不关」：on_command 返回锚点时，在**同一位置**重弹那一级
+          （原生 TrackPopupMenu 时代就是这样，行为不变）。
 
         位置固定用第一次弹出的坐标：菜单才不会点一下跳一下。
         """
-        origin = None
-        for _ in range(MAX_POPUP_ROUNDS):
-            menu = self._build_menu(anchor)
-            if not menu:
-                return
-            if origin is None:
-                point = wintypes.POINT()
-                user32.GetCursorPos(ctypes.byref(point))
-                origin = (point.x, point.y)
-            # 必须先置前台，否则点菜单外面菜单不会消失
-            user32.SetForegroundWindow(self._hwnd)
-            command = user32.TrackPopupMenu(
-                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                origin[0], origin[1], 0, self._hwnd, None,
-            )
-            user32.PostMessageW(self._hwnd, 0, 0, 0)
-            user32.DestroyMenu(menu)
-            if not command:
-                return                      # 点空白处关掉了
-            anchor = self._on_command(int(command))
-            if not anchor:
-                return                      # 普通命令：照常关闭
+        from . import ctxmenu
+        menu = self._build_menu(anchor)
+        if not menu:
+            return
+        entries = MenuBuilder.entries_of(menu)
+        # 自绘菜单只吃 entries，原生 HMENU 没用了（它只是为旧断言顺带建的）
+        user32.DestroyMenu(menu)
+        MenuBuilder.discard(menu)
+        if not entries:
+            return
+        if origin is None:
+            point = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(point))
+            origin = (point.x, point.y)
+
+        def _dispatch(command: int) -> None:
+            nxt = self._on_command(int(command))
+            if nxt:
+                # 「点完不关」的命令：在同一位置重弹它所属的那一级
+                self._popup(nxt, origin)
+
+        ctxmenu.show(entries, origin[0], origin[1], _dispatch)
 
 
 # --------------------------------------------------------------------- 菜单构建
 
 
 class MenuBuilder:
-    """小助手：把菜单项拼装得更可读。"""
+    """小助手：把菜单项拼装得更可读。
+
+    除了拼出原生 HMENU（自检里要用 ``GetMenuItemCount`` 这类 API 做断言），
+    同时把结构记进 ``entries`` —— **自绘菜单（ctxmenu）消费的是这份结构**，
+    原生菜单只是顺带的、兼容旧断言的产物。attach 的子菜单结构直接嵌进
+    ``entries``，所以弹出期间子菜单内容不需要再回去问 app。
+    """
+
+    _registry: dict[int, "MenuBuilder"] = {}
 
     def __init__(self) -> None:
         self.handle = user32.CreatePopupMenu()
+        self.entries: list[dict] = []
+        self._submenus: list["MenuBuilder"] = []
+        MenuBuilder._registry[self.handle] = self
+
+    @classmethod
+    def entries_of(cls, handle) -> list[dict] | None:
+        builder = cls._registry.get(int(handle))
+        return builder.entries if builder is not None else None
+
+    @classmethod
+    def discard(cls, handle) -> None:
+        """原生 HMENU 销毁后顺手反注册（含级联的子菜单），别让注册表一直涨。"""
+        builder = cls._registry.pop(int(handle), None)
+        if builder is None:
+            return
+        for sub in builder._submenus:
+            cls.discard(sub.handle)
 
     def label(self, text: str, value: str = "") -> "MenuBuilder":
-        """只读信息行（灰色不可点）。"""
+        """只读信息行（灰色不可点）。``value`` 画在右侧（如「今日  1.24 kWh」）。"""
         text_ = f"{text}\t{value}" if value else text
         user32.AppendMenuW(self.handle, MF_STRING | MF_GRAYED, 0, text_)
+        self.entries.append({"type": "label", "text": text, "value": value})
         return self
 
     def item(self, cmd: int, text: str, checked: bool = False,
-             enabled: bool = True) -> "MenuBuilder":
+             enabled: bool = True, radio: bool = False) -> "MenuBuilder":
         flags = MF_STRING | (MF_CHECKED if checked else 0)
         if not enabled:
             flags |= MF_GRAYED
         user32.AppendMenuW(self.handle, flags, cmd, text)
+        self.entries.append({
+            "type": "item", "cmd": int(cmd), "text": text,
+            "checked": bool(checked), "enabled": bool(enabled),
+            "radio": bool(radio),
+        })
         return self
 
     def separator(self) -> "MenuBuilder":
         user32.AppendMenuW(self.handle, MF_SEPARATOR, 0, None)
+        self.entries.append({"type": "sep"})
         return self
 
     def attach(self, text: str, submenu: "MenuBuilder") -> "MenuBuilder":
         user32.AppendMenuW(self.handle, MF_POPUP, submenu.handle, text)
+        self._submenus.append(submenu)
+        self.entries.append({"type": "sub", "text": text,
+                             "entries": submenu.entries})
         return self
 
     @staticmethod

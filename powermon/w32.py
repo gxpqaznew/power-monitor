@@ -620,6 +620,12 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
 user32.EnumChildWindows.restype = wintypes.BOOL
 
+# 这个窗口属于哪个进程。任务栏子树里会同时存在**别的进程**画的窗口（本机常驻的
+# 正式版长条就是），做「某个窗口类不许再出现」这类断言时必须能把它过滤掉，
+# 否则旧版进程在线就会让断言永远 FAIL —— 一条修不掉的假警报。
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
 # WM_SETCURSOR 的 lparam 低 16 位：命中测试码。只有 HTCLIENT 才该改光标，
 # 落在边框/标题栏上改了就变成「光标自己乱闪」。
 HTCLIENT = 1

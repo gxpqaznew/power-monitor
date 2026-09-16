@@ -89,11 +89,16 @@ def send(hwnd, msg, wparam=0, lparam=0):
     return user32.SendMessageW(hwnd, msg, wparam, lparam)
 
 
-def taskbar_descendants() -> list[tuple[int, str]]:
+def taskbar_descendants(pid_only: int | None = None) -> list[tuple[int, str]]:
     """任务栏整棵子树（含深层）的 (hwnd, 类名)。
 
     长条是 ``Shell_TrayWnd`` 的**子窗口**，所以不能用 EnumWindows 找 ——
     那个只枚举顶层窗口，长条一个都看不见。
+
+    ``pid_only`` 只要某个进程的窗口。做「某个窗口类不许出现」的断言时必须用它：
+    本机常年跑着**正式版**（它也有长条、也在任务栏子树里），如果那是带把手的老版本，
+    那两块把手窗口就会被一起统计进来 —— 那是旧进程的痕迹，不是这次代码的问题，
+    算进来等于一条永远修不掉的假警报（实测就这么 FAIL 过一次）。
     """
     tray = user32.FindWindowW("Shell_TrayWnd", None)
     out: list[tuple[int, str]] = []
@@ -101,6 +106,8 @@ def taskbar_descendants() -> list[tuple[int, str]]:
         return out
 
     def _cb(hwnd, _lparam):
+        if pid_only is not None and _pid_of(hwnd) != pid_only:
+            return True
         out.append((hwnd, _class_of(hwnd)))
         return True
 
@@ -112,6 +119,12 @@ def _class_of(hwnd) -> str:
     buf = ctypes.create_unicode_buffer(128)
     user32.GetClassNameW(hwnd, buf, 128)
     return buf.value
+
+
+def _pid_of(hwnd) -> int:
+    pid = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
 
 
 def ex_style(hwnd) -> int:

@@ -252,15 +252,24 @@ class TrayIcon:
         )
         return dup
 
-    def _add(self, retries: int = 1) -> bool:
+    def _add(self, retries: int = 1, *, blocking: bool = True) -> bool:
         """注册托盘图标。
 
         ``Shell_NotifyIcon`` 是「一问一答」的跨进程调用：任务栏没及时答复
         就返回失败，但这不是永久性故障。失败一次就放弃会让程序误判成
         「系统没有通知区域」而降级，所以按次重试。
+
+        🔴 ``blocking=False`` = **绝不 sleep**，只能在窗口过程里用（当前只有
+        ``TaskbarCreated`` 这一处）。失败路径上的 ``sleep(NIM_ADD_DELAY)`` 是
+        2 秒一次，而 ``TaskbarCreated`` 是在窗口过程里**同步**处理的 ——
+        在那个线程上睡 4 秒，整个托盘窗口就 4 秒收不到任何消息，右键弹不出
+        菜单、双击也没反应（用户报的就是这个）。不阻塞时没有「等一会儿再试」
+        的余地，所以重试次数直接压成 1，补偿交给 ``ensure_added()``（定时器驱动）。
         """
         # 每次 ADD 都从完整态出发（原因见 _sync_nid）
         self._sync_nid()
+        if not blocking:
+            retries = 1
         for attempt in range(1, retries + 1):
             ctypes.set_last_error(0)
             if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
@@ -276,13 +285,36 @@ class TrayIcon:
         self._added = False
         return False
 
+    def _reassert(self) -> bool:
+        """图标还在、只是被重复注册拒绝时，用 NIM_MODIFY 把回调重新登记一遍。
+
+        实测（``_trayaddprobe.py``）：对**已存在**的图标重复 NIM_ADD 会**立刻**
+        返回 FALSE / ``E_FAIL``(0x80004005)，紧接着 NIM_MODIFY（带
+        ``NIF_ICON|NIF_MESSAGE|NIF_TIP``）返回成功 —— 说明图标、hWnd、uID 都还在，
+        只是 ADD 语义上「已经有了」。这种情况下图标本来就是好的，MODIFY 一遍
+        即完成重新登记，且不花时间（对比：硬重试要睡 ``NIM_ADD_DELAY`` ×2 = 4 秒）。
+        """
+        if not self._hwnd:
+            return False
+        self._sync_nid()
+        if shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._nid)):
+            self._added = True
+            _dbg("托盘重注册：ADD 被拒（图标已存在）→ NIM_MODIFY 重新登记成功")
+            return True
+        return False
+
     def ensure_added(self) -> bool:
-        """补偿入口：还没注册成功时再试一次，由定时器周期性调用。"""
+        """补偿入口：还没注册成功时再试一次，由定时器周期性调用。
+
+        🔴 ADD 失败**不等于**图标没了 —— 重复 ADD 必然失败。所以失败后再问一次
+        ``_reassert()``：图标若还在就是好的，别把「图标好好的」误判成「系统没有
+        通知区域」而降级成普通窗口（那样用户连入口都没了）。
+        """
         if self._added:
             return True
         if not self._hwnd:
             return False
-        return self._add(retries=1)
+        return self._add(retries=1) or self._reassert()
 
     @property
     def added(self) -> bool:
@@ -383,9 +415,18 @@ class TrayIcon:
 
         if msg == self._taskbar_created and self._taskbar_created:
             # 资源管理器重启过，托盘被清空，必须重新注册
+            #
+            # 🔴 这里**绝不允许阻塞**：TaskbarCreated 是在窗口过程里同步处理的，
+            # 一旦走到失败路径的 ``sleep(NIM_ADD_DELAY)``（2 秒/次，retries=3 就是
+            # 4 秒），托盘窗口这几秒内收不到任何消息 —— 用户看到的是「点了常驻/
+            # explorer 重启之后，右键几秒钟弹不出菜单、双击也没反应」。
+            # 所以：只试一次，不睡；失败立刻退到 NIM_MODIFY 重新登记；
+            # 两条都不成才交给定时器（``ensure_added``）慢慢补。
             _dbg("收到 TaskbarCreated，重新注册托盘")
             self._added = False
-            ok = self._add(retries=3)
+            ok = self._add(retries=1, blocking=False)
+            if not ok:
+                ok = self._reassert()
             if self._extra is not None:
                 self._extra(WM_TRAY_READDED, 1 if ok else 0, 0)
             return True, 0

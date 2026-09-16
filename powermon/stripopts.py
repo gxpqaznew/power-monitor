@@ -331,12 +331,30 @@ def bg_fit(cfg) -> str:
     return value if value in BG_FIT_KEYS else "cover"
 
 
-def bg_opacity(cfg) -> int:
+def normalize_opacity(raw) -> int:
+    """把「不透明度」收敛成 0~100 的整数百分比。
+
+    🔴 为什么不能只写 ``int(raw)``：量纲是 **0~100**，而人呢，看到「不透明度」很
+    自然就写 ``0.85`` 这种分数。``int(0.85)`` == **0**，而 0 在 ``_paint_image``
+    里是「直接 return」—— 表现成「设了背景图但完全不显示」，且**一点报错都没有**
+    （图片解码失败、路径不对、GDI+ 起不来，全都是安静跳过）。这类「手改 config
+    之后功能静默失效」的坑本项目踩过不止一次，所以在入口处顺手认一下分数：
+    ``(0, 1]`` 的小数按比例放大成百分比（0.85 → 85、1.0 → 100）。
+    整数照旧 —— 写 ``1`` 就是 1%（不是 100%），别自作主张。
+    """
+    if isinstance(raw, bool):
+        return 100
+    if isinstance(raw, float) and 0.0 < raw <= 1.0:
+        raw = round(raw * 100)
     try:
-        value = int(getattr(cfg, "strip_bg_opacity", 100))
+        value = int(raw)
     except (TypeError, ValueError):
         return 100
     return max(BG_OPACITY_MIN, min(BG_OPACITY_MAX, value))
+
+
+def bg_opacity(cfg) -> int:
+    return normalize_opacity(getattr(cfg, "strip_bg_opacity", 100))
 
 
 def show_label(cfg) -> bool:

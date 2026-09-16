@@ -218,6 +218,17 @@ def main() -> int:
           stripopts.bg_opacity(base_cfg(strip_bg_opacity=999)) == 100
           and stripopts.bg_opacity(base_cfg(strip_bg_opacity=-5)) == 0
           and stripopts.bg_opacity(base_cfg(strip_bg_opacity="x")) == 100)
+    # 🔴 量纲是 0~100，但手改 config 写 0.85（分数）太自然了。只写 int() 会得到
+    #    0，而 0 = 「不画背景图」→ 用户看到的是「设了背景图但完全不显示」，
+    #    而且一声不响。所以 (0,1] 的小数按分数认；整数照旧（1 就是 1%）。
+    check("bg_opacity 认「分数」写法（0.85 → 85，不是 0）",
+          stripopts.bg_opacity(base_cfg(strip_bg_opacity=0.85)) == 85
+          and stripopts.bg_opacity(base_cfg(strip_bg_opacity=1.0)) == 100
+          and stripopts.bg_opacity(base_cfg(strip_bg_opacity=1)) == 1
+          and stripopts.bg_opacity(base_cfg(strip_bg_opacity=0.0)) == 0,
+          f"0.85→{stripopts.bg_opacity(base_cfg(strip_bg_opacity=0.85))} "
+          f"1.0→{stripopts.bg_opacity(base_cfg(strip_bg_opacity=1.0))} "
+          f"1→{stripopts.bg_opacity(base_cfg(strip_bg_opacity=1))}")
     check("show_label / show_divider 非 bool 时当作 True",
           stripopts.show_label(base_cfg(strip_show_label="yes")) is True
           and stripopts.show_divider(base_cfg(strip_show_divider=0)) is True)

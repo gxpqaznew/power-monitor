@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -205,6 +206,42 @@ def main() -> int:
                   f"{[uid for a, _f, _c, uid in calls if a == w32.NIM_ADD]}")
         finally:
             w32.shell32.Shell_NotifyIconW = real_sni
+
+        # ---- 7b. 重注册**绝不许阻塞**（★ 用户报的「几秒钟右键没反应」）------
+        # TaskbarCreated 是在窗口过程里**同步**处理的，老代码走失败路径
+        # sleep(NIM_ADD_DELAY=2.0) × 2 = 4 秒，这几天托盘收不到任何消息。
+        # 真机实测：老代码重注册后 5.55 s 才弹得出菜单，修完 < 1 s。
+        # 这里用「SNI 永远失败」把它逼进失败路径，纯逻辑地量时间 —— 不需要真机。
+        fail_calls: list[int] = []
+        real_sni2 = w32.shell32.Shell_NotifyIconW
+
+        def always_fail(action, nid_ptr):
+            fail_calls.append(int(action))
+            return 0
+
+        w32.shell32.Shell_NotifyIconW = always_fail
+        try:
+            t5 = make(c)
+            t5._hwnd = 0x1234
+            t5._hicon = 0x5678
+            t5._tip = "init"
+            t0 = time.monotonic()
+            t5._on_message(t5._taskbar_created, 0, 0)
+            dt = time.monotonic() - t0
+            check("★ TaskbarCreated 失败路径不许 sleep（老代码阻塞 4 秒）",
+                  dt < 0.5, f"耗时 {dt:.2f}s（老代码 ≈ 4.00s）")
+            check("失败后还会用 NIM_MODIFY 试一次重新登记"
+                  "（图标其实还在，只是重复 ADD 被拒）",
+                  w32.NIM_MODIFY in fail_calls,
+                  f"actions={[hex(a) for a in fail_calls]}")
+            calls.clear()
+            fail_calls.clear()
+            check("ensure_added 失败也不会误判成「没有通知区域」"
+                  "（ADD 失败 → 退到 MODIFY）",
+                  t5.ensure_added() is False and w32.NIM_MODIFY in fail_calls,
+                  f"actions={[hex(a) for a in fail_calls]}")
+        finally:
+            w32.shell32.Shell_NotifyIconW = real_sni2
 
         # ---- 8. 双击：显示卡片，而不是 toggle 两次 ------------------
         c.reset()

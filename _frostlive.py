@@ -24,7 +24,7 @@ from ctypes import wintypes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from powermon.w32 import gdi32, user32  # noqa: E402
+from powermon.w32 import GWL_EXSTYLE, WS_EX_TRANSPARENT, gdi32, user32  # noqa: E402
 
 OUT = Path(__file__).resolve().parent / "_preview"
 SRCCOPY = 0x00CC0020
@@ -256,39 +256,51 @@ def main() -> int:
           f"{n_col} 种取值")
 
     # ---- 2. 右键菜单（真输入）----
+    # 🔴 先看长条是不是「锁定位置」状态。锁定时程序会给它加回 WS_EX_TRANSPARENT，
+    #    也就是**故意点击穿透**（这样才不会挡住任务栏那一片的点击）；此时在长条上
+    #    右键会被任务栏吃掉，拿不到菜单 —— 这是设计行为，不是 bug。
+    #    这个判据以前没看这个开关，碰上用户把长条锁了就会假 FAIL（踩过）。
+    locked = bool(user32.GetWindowLongPtrW(strip, GWL_EXSTYLE) & WS_EX_TRANSPARENT)
+    if locked:
+        print("[SKIP] 长条处于「锁定位置」状态（WS_EX_TRANSPARENT = 故意点击穿透），"
+              "在长条上右键本来就该落到任务栏上，不适用这项判据。")
+        print("       想看菜单毛玻璃：右键**托盘图标**（_menulive.py 走那条路），"
+              "或先在托盘菜单里点「解锁位置」再跑本脚本。")
     cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
-    real_right_click(cx, cy)
-    time.sleep(1.2)
-    menu = find_menu()
-    if not menu:
+    if not locked:
+        real_right_click(cx, cy)
+        time.sleep(1.2)
+    menu = None if locked else find_menu()
+    if not locked and not menu:
         check("真输入右键后菜单存在", False)
         return 1
-    mr = wintypes.RECT()
-    user32.GetWindowRect(menu, ctypes.byref(mr))
-    mw, mh = mr.right - mr.left, mr.bottom - mr.top
-    print(f"菜单 rect = ({mr.left},{mr.top},{mr.right},{mr.bottom}) {mw}x{mh}")
-    m_pad = 8
-    menu_px = grab(mr.left - m_pad, mr.top - m_pad, mw + m_pad * 2, mh + m_pad * 2)
-    write_png(OUT / "frost_menu_live.png", menu_px, mw + m_pad * 2,
-              mh + m_pad * 2, zoom=3)
+    if menu:
+        mr = wintypes.RECT()
+        user32.GetWindowRect(menu, ctypes.byref(mr))
+        mw, mh = mr.right - mr.left, mr.bottom - mr.top
+        print(f"菜单 rect = ({mr.left},{mr.top},{mr.right},{mr.bottom}) {mw}x{mh}")
+        m_pad = 8
+        menu_px = grab(mr.left - m_pad, mr.top - m_pad, mw + m_pad * 2, mh + m_pad * 2)
+        write_png(OUT / "frost_menu_live.png", menu_px, mw + m_pad * 2,
+                  mh + m_pad * 2, zoom=3)
 
-    # 菜单卡片：只统计暗像素（底色），文字和卡片外的阴影 / 桌面自动被滤掉
-    n_col2, spread2, mean2, frac2 = dark_stats(
-        menu_px, mw + m_pad * 2, mh + m_pad * 2,
-        m_pad, m_pad, m_pad + mw, m_pad + mh)
-    print(f"菜单：暗像素占比 {frac2:.2f}，其中不同取值 {n_col2} 种，"
-          f"相邻灰度差中位 {spread2:.1f}，均值 {mean2:.0f}")
+        # 菜单卡片：只统计暗像素（底色），文字和卡片外的阴影 / 桌面自动被滤掉
+        n_col2, spread2, mean2, frac2 = dark_stats(
+            menu_px, mw + m_pad * 2, mh + m_pad * 2,
+            m_pad, m_pad, m_pad + mw, m_pad + mh)
+        print(f"菜单：暗像素占比 {frac2:.2f}，其中不同取值 {n_col2} 种，"
+              f"相邻灰度差中位 {spread2:.1f}，均值 {mean2:.0f}")
 
-    check("菜单主体仍是深色卡片", frac2 > 0.4, f"暗像素占比 {frac2:.2f}")
-    check("卡片底色不是纯色（背后真的被糊进来了）", n_col2 > 4,
-          f"暗像素里有 {n_col2} 种取值")
-    check("底色是平滑过渡不是噪点（相邻灰度差中位数够小）",
-          0 <= spread2 <= 6, f"中位 |Δ| = {spread2:.1f}")
+        check("菜单主体仍是深色卡片", frac2 > 0.4, f"暗像素占比 {frac2:.2f}")
+        check("卡片底色不是纯色（背后真的被糊进来了）", n_col2 > 4,
+              f"暗像素里有 {n_col2} 种取值")
+        check("底色是平滑过渡不是噪点（相邻灰度差中位数够小）",
+              0 <= spread2 <= 6, f"中位 |Δ| = {spread2:.1f}")
 
-    # 关掉菜单
-    user32.keybd_event(0x1B, 0, 0, 0)
-    user32.keybd_event(0x1B, 0, 2, 0)
-    time.sleep(0.6)
+        # 关掉菜单
+        user32.keybd_event(0x1B, 0, 0, 0)
+        user32.keybd_event(0x1B, 0, 2, 0)
+        time.sleep(0.6)
 
     print(f"\n图片已写到 {OUT}")
     print(f"通过 {PASS} 项，失败 {FAIL} 项")

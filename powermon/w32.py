@@ -95,6 +95,7 @@ WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
 WM_PIN_READY = WM_APP + 2  # 自用：常驻任务的准备结果通知主线程
 WM_TRAY_READDED = WM_APP + 3  # 自用：explorer 重启后托盘已重新注册
+WM_MENU_TAKEFOCUS = WM_APP + 4  # 自用：菜单弹出后推后一条消息再抢前台（见 ctxmenu）
 
 # MessageBox
 MB_OK = 0x00000000
@@ -344,6 +345,10 @@ user32.LoadImageW.argtypes = [
 user32.LoadImageW.restype = wintypes.HANDLE
 user32.GetKeyState.argtypes = [ctypes.c_int]
 user32.GetKeyState.restype = ctypes.c_short
+# 🔴 必须声明 restype=c_short：GetAsyncKeyState 返回的是 SHORT（AX），EAX 高位在
+# 某些路径上没定义，按 c_int 读会拿到脏的高位，「按下」判据就随机了。
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
 user32.AdjustWindowRectEx.argtypes = [
@@ -522,6 +527,11 @@ IDCANCEL = 2
 VK_TAB = 0x09
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+VK_MBUTTON = 0x04
+VK_XBUTTON1 = 0x05
+VK_XBUTTON2 = 0x06
 
 # WM_COMMAND 高位字里的通知码
 BN_CLICKED = 0
@@ -657,6 +667,8 @@ user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 # 非前台进程抢前台要用 AttachThreadInput 附着到当前前台线程再 SetForegroundWindow。
 user32.GetFocus.argtypes = []
 user32.GetFocus.restype = wintypes.HWND
+user32.SetFocus.argtypes = [wintypes.HWND]
+user32.SetFocus.restype = wintypes.HWND
 user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 user32.AttachThreadInput.restype = wintypes.BOOL
 kernel32.GetCurrentThreadId.argtypes = []
@@ -686,6 +698,20 @@ class TRACKMOUSEEVENT(ctypes.Structure):
 
 user32.TrackMouseEvent.argtypes = [ctypes.POINTER(TRACKMOUSEEVENT)]
 user32.TrackMouseEvent.restype = wintypes.BOOL
+
+# 「此刻有没有鼠标键按着」。自绘菜单判断 KILLFOCUS 是「用户点别处」还是
+# 「系统自己把焦点抖走」全靠它：真的点别处时 WM_KILLFOCUS 是在按下那一下的
+# 消息里同步送来的（激活变更由点击触发），此刻键仍然是按下的；
+# 而 explorer 处理完那次点击归还前台时早松手了，读出来是 0。
+_ASYNC_DOWN = 0x8000
+
+
+def mouse_button_down() -> bool:
+    """当前是否有任何一个鼠标键处于按下状态（左/右/中/侧键）。"""
+    for vk in (VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2):
+        if user32.GetAsyncKeyState(vk) & _ASYNC_DOWN:
+            return True
+    return False
 
 
 def int_resource(value: int):

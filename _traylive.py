@@ -268,6 +268,18 @@ def main() -> int:
     cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
     print(f"图标矩形 {rect} → 点 ({cx},{cy})")
 
+    # 🔴 冷启动前几秒点它是没用的：程序还在采第一帧、建长条、暖毛玻璃缓存。
+    #    实测刚启动 12 秒时第一下右键会失灵（图标在、位置也对，就是没反应），
+    #    跑几个用例之后就 4/4 全稳。所以先等它进稳态再开始，否则会误判成 bug。
+    strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip")
+    waited = 0.0
+    while strip is None and waited < 10.0:
+        pump(0.5)
+        waited += 0.5
+        strip = find_window_by_class(pids, "PowerMonitorTaskbarStrip")
+    print(f"等程序进稳态：长条窗口 {'已出现' if strip else '没出现'}（{waited:.1f}s）")
+    pump(2.0)
+
     # 清场：上一轮留下的菜单 / 面板会把断言顶成恒真
     close_menus_now()
     panel = user32.FindWindowW(PANEL_CLASS, None)

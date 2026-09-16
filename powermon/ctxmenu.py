@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 import traceback
 
 from . import debug, frost
@@ -54,6 +55,7 @@ from .w32 import (
     WM_KEYDOWN,
     WM_KILLFOCUS,
     WM_LBUTTONUP,
+    WM_MENU_TAKEFOCUS,
     WM_MOUSELEAVE,
     WM_MOUSEMOVE,
     WM_TIMER,
@@ -65,6 +67,7 @@ from .w32 import (
     WS_POPUP,
     gdi32,
     kernel32,
+    mouse_button_down,
     user32,
     wintypes,
 )
@@ -110,6 +113,17 @@ _windows: dict[int, "CtxMenu"] = {}
 _chain: list["CtxMenu"] = []          # 当前打开着的菜单（根在前、子孙在后）
 _wndproc_ref: WNDPROC | None = None
 _closing = False                      # close_all 重入保护（销毁会再触发 KILLFOCUS）
+
+# 刚弹出后多久算「还在落座」。这段时间里收到的 WM_KILLFOCUS 不当「点别处」——
+# 打开菜单的那一次点击本身会带得焦点晃一下（explorer 处理完点击可能把前台还给
+# 任务栏），同步抢前台时这几乎是必然发生的。实测：关掉详情卡片之后紧接着右键，
+# 约 1/3 次菜单会刚出现几十毫秒就消失，用户看到的是「右键弹不出来」。
+#
+# 🔴 宽限**不是无条件的**：另外还要「此刻没有鼠标键按着」才重抢（见 _on_message
+# 里 WM_KILLFOCUS 那段）。用户真去点别处时键是按下的，宽限必须马上让位，
+# 否则会变成「落座期内点别处菜单关不掉」—— 把毛病从一头换到另一头。
+_POPUP_SETTLE = 0.35
+_REFOCUS_TRIES = 3                    # 落座期内最多重抢几次，别和系统死磕
 
 
 def _dbg(msg: str) -> None:
@@ -608,6 +622,14 @@ class CtxMenu:
         self._is_sub = is_sub
         self._geom = None
         self._base = None
+        # 抢前台的时刻 + 已重抢次数（落座期宽限用，见 _POPUP_SETTLE）
+        self._focus_at = 0.0
+        self._refocus_tries = 0
+        # 弹出这一刻有没有鼠标键已经按着。两条弹菜单的路都是在 BUTTONUP 上弹的
+        # （托盘 WM_RBUTTONUP / 长条自接 WM_RBUTTONUP），所以这里正常恒为 False。
+        # 留这个记录是为了堵一类将来才可能出现的误判：万一哪条路改成「按下就弹」，
+        # 落座期内那次「假 KILLFOCUS」就会带着按下的键，被当成用户点了别处秒关。
+        self._btn_at_show = mouse_button_down()
 
         # 先定位置、再渲染：毛玻璃要抓卡片背后那块屏幕，铺底之前得知道卡片落在哪。
         # ``_place`` 只认 geom 的宽高 + origin（子菜单那支还读父菜单的 geom，那个
@@ -641,7 +663,20 @@ class CtxMenu:
         _chain.append(self)
         self._redraw()
         user32.ShowWindow(self._hwnd, SW_SHOW)
-        _force_foreground(self._hwnd)
+        # 🔴 抢前台**推到当前消息处理完之后**再做，别同步抢。
+        #
+        # ``show()`` 是在调用方的窗口过程里同步跑的：托盘那条路是 explorer 用
+        # ``SendMessage`` 把点击转过来，此刻 explorer **还没处理完这次点击** ——
+        # 它返回后会把前台还给任务栏，于是我们刚抢到手的前台被顶掉，菜单立刻收到
+        # ``WM_KILLFOCUS`` 被关掉。
+        #
+        # 实测（``_menuflakeprobe.py``，20 轮）：
+        #   * 直接右键托盘图标          → 20/20 正常（同步抢也来得及）；
+        #   * 关掉详情卡片之后紧接着右键 → 约 1/3 次菜单**刚出现几十毫秒就消失**，
+        #     用户看到的就是「右键弹不出来」。
+        # 推后一条消息再做就轮到最后抢，站稳。配合 ``_POPUP_SETTLE`` 的落座宽限，
+        # 这条次序也能 20/20。
+        user32.PostMessageW(self._hwnd, WM_MENU_TAKEFOCUS, 0, 0)
         _dbg(f"弹出 rect=({x},{y},{geom.w},{geom.h}) 项数={len(entries)} sub={is_sub}")
 
     # ------------------------------------------------------------- 基础
@@ -787,6 +822,13 @@ class CtxMenu:
     # ------------------------------------------------------------- 消息
 
     def _on_message(self, msg, wparam, lparam):
+        if msg == WM_MENU_TAKEFOCUS:
+            # 落座：把前台抢到手，并记下时刻（KILLFOCUS 的宽限从这一刻算起）
+            if self._hwnd and user32.IsWindow(self._hwnd):
+                _force_foreground(self._hwnd)
+                self._focus_at = time.monotonic()
+            return True, 0
+
         if msg == WM_DESTROY:
             if self in _chain:
                 _chain.remove(self)
@@ -849,7 +891,30 @@ class CtxMenu:
             if not _closing:
                 focus = user32.GetFocus()
                 if focus not in _windows:
-                    close_all()
+                    # 落座期内（刚弹出这几百毫秒）收到的 KILLFOCUS 多半是
+                    # 「打开菜单的那次点击」把焦点带得晃了一下，不是用户点了别处。
+                    # 直接关掉的话用户看到的是「右键弹不出来」—— 重抢一次前台再说，
+                    # 抢不回来（或超出宽限）才真的当成「点别处」关掉。
+                    #
+                    # 🔴 宽限必须让位于「用户真的按了鼠标」。判据是**此刻有没有键按着**：
+                    # 用户点别处时，激活变更由那一下按下触发，KILLFOCUS 是在按下
+                    # 那条消息里同步送来的，读 GetAsyncKeyState 一定是按下；
+                    # 而 explorer 处理完点击、把前台还给任务栏那一下早松手了。
+                    # 少了这一条，宽限期内用户点别处菜单会「抢回来」，看着像关不掉。
+                    # （弹出那一刻就已经按着的键不算「这一次点击」，见 _btn_at_show。）
+                    settling = (self._focus_at
+                                and time.monotonic() - self._focus_at <= _POPUP_SETTLE)
+                    user_clicked = mouse_button_down() and not self._btn_at_show
+                    if settling and not user_clicked and self._refocus_tries < _REFOCUS_TRIES:
+                        self._refocus_tries += 1
+                        _dbg(f"落座期收到 KILLFOCUS（无键按下），"
+                             f"重抢前台（第 {self._refocus_tries} 次）")
+                        if self._hwnd and user32.IsWindow(self._hwnd):
+                            _force_foreground(self._hwnd)
+                    else:
+                        if settling and user_clicked:
+                            _dbg("落座期收到 KILLFOCUS，但鼠标键按着 → 当点别处，关")
+                        close_all()
             return True, 0
 
         return False, 0
